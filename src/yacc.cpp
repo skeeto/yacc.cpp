@@ -17,26 +17,25 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cctype>
 #include <cstdarg>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
+#include <format>
 #include <functional>
 #include <limits>
 #include <map>
 #include <memory>
 #include <optional>
 #include <set>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include "platform.hpp"
 
 namespace yacc {
 
@@ -58,19 +57,31 @@ struct YaccError : public std::exception {
     throw YaccError(msg);
 }
 
+// Append-only string builder.  Mirrors a tiny subset of std::ostream's
+// "<< operator chains" style without dragging in <iostream>.
+struct Buf {
+    std::string& s;
+    Buf& operator<<(std::string_view v)       { s.append(v); return *this; }
+    Buf& operator<<(const std::string& v)     { s.append(v); return *this; }
+    Buf& operator<<(const char* v)            { s.append(v); return *this; }
+    Buf& operator<<(char v)                   { s.push_back(v); return *this; }
+    Buf& operator<<(int v)                    { s.append(std::to_string(v)); return *this; }
+    Buf& operator<<(unsigned v)               { s.append(std::to_string(v)); return *this; }
+    Buf& operator<<(long v)                   { s.append(std::to_string(v)); return *this; }
+    Buf& operator<<(unsigned long v)          { s.append(std::to_string(v)); return *this; }
+    Buf& operator<<(long long v)              { s.append(std::to_string(v)); return *this; }
+    Buf& operator<<(unsigned long long v)     { s.append(std::to_string(v)); return *this; }
+};
+
 template <class... Args>
-[[noreturn]] static void fatalf(const char* fmt, Args... args) {
-    char buf[1024];
-    std::snprintf(buf, sizeof(buf), fmt, args...);
-    fatal(buf);
+[[noreturn]] static void fatalf(std::format_string<Args...> fmt, Args&&... args) {
+    fatal(std::format(fmt, std::forward<Args>(args)...));
 }
 
-static std::string read_file(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) fatalf("cannot open input file '%s'", path.c_str());
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
+static std::string load_input_file(const std::string& path) {
+    auto r = read_file(path);
+    if (!r.ok) fatalf("cannot open input file '{}'", path);
+    return std::move(r.content);
 }
 
 // Locale-free, ASCII-only character predicates.
@@ -282,7 +293,7 @@ public:
             while (pos_ < src_.size() && src_[pos_] != '>') {
                 tag.push_back(src_[pos_]); advance();
             }
-            if (pos_ >= src_.size()) fatalf("unterminated <tag> at line %d", sline);
+            if (pos_ >= src_.size()) fatalf("unterminated <tag> at line {}", sline);
             advance();
             return Token{Tok::Tag, std::move(tag), sline, scol};
         }
@@ -292,7 +303,7 @@ public:
             while (pos_ < src_.size() && src_[pos_] != ']') {
                 nm.push_back(src_[pos_]); advance();
             }
-            if (pos_ >= src_.size()) fatalf("unterminated [name] at line %d", sline);
+            if (pos_ >= src_.size()) fatalf("unterminated [name] at line {}", sline);
             advance();
             return Token{Tok::BracketName, std::move(nm), sline, scol};
         }
@@ -365,7 +376,7 @@ private:
             }
             out.push_back(src_[pos_]); advance();
         }
-        fatalf("unterminated %%{ block starting at line %d", start_line);
+        fatalf("unterminated %{{ block starting at line {}", start_line);
     }
 
     string read_brace_block(int& start_line) {
@@ -411,7 +422,7 @@ private:
                 out.push_back(c); advance();
             }
         }
-        fatalf("unterminated brace block starting at line %d", start_line);
+        fatalf("unterminated brace block starting at line {}", start_line);
     }
 
     Token percent_keyword(const string& kw, int sline, int scol) {
@@ -457,7 +468,7 @@ private:
             {"param", Tok::PercentParam},
         };
         for (auto& e : kws) if (kw == e.name) return Token{e.t, kw, sline, scol};
-        fatalf("unknown directive %%%s at line %d", kw.c_str(), sline);
+        fatalf("unknown directive %{} at line {}", kw, sline);
     }
 
     Token read_char_literal(int sline, int scol) {
@@ -466,7 +477,7 @@ private:
         int value = -1;
         if (pos_ < src_.size() && src_[pos_] == '\\') {
             raw.push_back('\\'); advance();
-            if (pos_ >= src_.size()) fatalf("bad char literal at line %d", sline);
+            if (pos_ >= src_.size()) fatalf("bad char literal at line {}", sline);
             char esc = src_[pos_];
             raw.push_back(esc); advance();
             switch (esc) {
@@ -502,7 +513,7 @@ private:
             raw.push_back(src_[pos_]); advance();
         }
         if (pos_ >= src_.size() || src_[pos_] != '\'')
-            fatalf("unterminated char literal at line %d", sline);
+            fatalf("unterminated char literal at line {}", sline);
         advance();
         Token t{Tok::CharLit, raw, sline, scol};
         t.char_value = value;
@@ -518,7 +529,7 @@ private:
             }
             body.push_back(src_[pos_]); advance();
         }
-        if (pos_ >= src_.size()) fatalf("unterminated string literal at line %d", sline);
+        if (pos_ >= src_.size()) fatalf("unterminated string literal at line {}", sline);
         advance();
         return Token{Tok::StrLit, std::move(body), sline, scol};
     }
@@ -567,7 +578,7 @@ private:
     bool at(Tok t) const { return peek_.kind == t; }
     void expect(Tok t, const char* what) {
         if (peek_.kind != t)
-            fatalf("expected %s at line %d, got \"%s\"", what, peek_.line, peek_.text.c_str());
+            fatalf("expected {} at line {}, got \"{}\"", what, peek_.line, peek_.text.c_str());
         advance();
     }
 
@@ -650,7 +661,7 @@ private:
                 while (at(Tok::Identifier) || at(Tok::CharLit) || at(Tok::StrLit)) advance();
                 return;
             default:
-                fatalf("unexpected '%s' at line %d", t.text.c_str(), t.line);
+                fatalf("unexpected '{}' at line {}", t.text.c_str(), t.line);
         }
     }
 
@@ -685,7 +696,7 @@ private:
     void parse_code() {
         string qual;
         if (at(Tok::Identifier)) { qual = peek_.text; advance(); }
-        if (!at(Tok::BraceBlock)) fatalf("%%code: expected { at line %d", peek_.line);
+        if (!at(Tok::BraceBlock)) fatalf("%code: expected {{ at line {}", peek_.line);
         const string& body = peek_.text;
         if (qual.empty()) g_.prologue += body;
         else if (qual == "requires") g_.prologue_requires += body;
@@ -696,14 +707,14 @@ private:
     }
 
     void parse_expect(bool rr) {
-        if (!at(Tok::Int)) fatalf("expected integer at line %d", peek_.line);
+        if (!at(Tok::Int)) fatalf("expected integer at line {}", peek_.line);
         if (rr) g_.expected_rr = (int)peek_.ival; else g_.expected_sr = (int)peek_.ival;
         advance();
     }
 
     void parse_union_decl() {
         if (at(Tok::Identifier)) { g_.api_value_union_name = peek_.text; advance(); }
-        if (!at(Tok::BraceBlock)) fatalf("%%union: expected { at line %d", peek_.line);
+        if (!at(Tok::BraceBlock)) fatalf("%union: expected {{ at line {}", peek_.line);
         g_.union_body = peek_.text;
         g_.has_union = true;
         advance();
@@ -711,7 +722,7 @@ private:
 
     void parse_start_decl() {
         if (!at(Tok::Identifier))
-            fatalf("expected identifier after %%start at line %d", peek_.line);
+            fatalf("expected identifier after %start at line {}", peek_.line);
         int idx = g_.find(peek_.text);
         if (idx < 0) idx = g_.intern(peek_.text, false);
         else g_.syms[idx].is_terminal = false;
@@ -753,7 +764,7 @@ private:
                 advance();
                 if (at(Tok::Int)) {
                     if (peek_.ival < 0 || peek_.ival > 65535)
-                        fatalf("token code out of range (0..65535) at line %d", peek_.line);
+                        fatalf("token code out of range (0..65535) at line {}", peek_.line);
                     explicit_code = (int)peek_.ival;
                     advance();
                 }
@@ -777,12 +788,12 @@ private:
                 g_.syms[aidx].is_terminal = true;
             }
         }
-        if (!any) fatalf("no symbols in declaration at line %d", peek_.line);
+        if (!any) fatalf("no symbols in declaration at line {}", peek_.line);
     }
 
     void parse_rule() {
         if (peek_.kind != Tok::Identifier_Colon)
-            fatalf("expected rule LHS at line %d, got \"%s\"", peek_.line, peek_.text.c_str());
+            fatalf("expected rule LHS at line {}, got \"{}\"", peek_.line, peek_.text.c_str());
         Token lhs = peek_;
         advance();
         string lhs_name;
@@ -847,7 +858,7 @@ private:
                     if (idx < 0) idx = g_.intern(peek_.text, true);
                     advance();
                 } else if (at(Tok::CharLit)) { idx = sym_of_char(peek_); advance(); }
-                else fatalf("expected token after %%prec at line %d", peek_.line);
+                else fatalf("expected token after %prec at line {}", peek_.line);
                 p.prec = g_.syms[idx].prec;
                 p.assoc = g_.syms[idx].assoc;
                 p.prec_sym = idx;
@@ -869,8 +880,8 @@ private:
                 } else {
                     // Mid-rule action: synthesize $@N -> /* empty */ { action } ;
                     static int mr_id = 0;
-                    char buf[32]; std::snprintf(buf, sizeof(buf), "$@%d", ++mr_id);
-                    int mr_idx = g_.intern(buf, false);
+                    std::string mr_name = "$@" + std::to_string(++mr_id);
+                    int mr_idx = g_.intern(mr_name, false);
                     g_.syms[mr_idx].defined = true;
                     Production mp;
                     mp.lhs = mr_idx;
@@ -1453,12 +1464,14 @@ public:
     Emitter(const Grammar& g, const LALR& l, const Options& o)
         : g_(g), l_(l), opts_(o) {}
 
-    void emit(std::ostream& out, std::ostream* hdr) {
+    void emit(Buf out, Buf* hdr) {
         emit_prefix(out);
         if (hdr) emit_prefix(*hdr);
 
         // Tokens & YYSTYPE: emitted in both header (if any) and source.
-        std::ostringstream tokens, value_type;
+        std::string tokens_s, vt_s;
+        Buf tokens{tokens_s};
+        Buf value_type{vt_s};
         emit_token_kinds(tokens);
         emit_value_type(value_type);
 
@@ -1469,8 +1482,8 @@ public:
             *hdr << "#if YYDEBUG\nextern int yydebug;\n#endif\n";
             if (!g_.prologue_requires.empty())
                 *hdr << "/* %code requires */\n" << g_.prologue_requires << "\n";
-            *hdr << tokens.str();
-            *hdr << value_type.str();
+            *hdr << tokens_s;
+            *hdr << vt_s;
             *hdr << "extern YYSTYPE yylval;\n";
             *hdr << "int yyparse(void);\n";
             if (!g_.prologue_provides.empty())
@@ -1487,8 +1500,8 @@ public:
             if (!opts_.no_lines) out << "#line 1 \"" << g_.source_file << "\"\n";
             out << g_.prologue << "\n";
         }
-        out << tokens.str();
-        out << value_type.str();
+        out << tokens_s;
+        out << vt_s;
 
         emit_constants(out);
         emit_translation_table(out);
@@ -1510,7 +1523,7 @@ private:
     const LALR& l_;
     const Options& opts_;
 
-    void emit_prefix(std::ostream& out) {
+    void emit_prefix(Buf out) {
         out << "/* yacc.cpp generated parser */\n";
     }
 
@@ -1525,15 +1538,18 @@ private:
                 case '\r': r += "\\r"; break;
                 default:
                     if ((unsigned char)c < 0x20) {
-                        char b[8]; std::snprintf(b, sizeof(b), "\\%03o", (unsigned char)c);
-                        r += b;
+                        unsigned char uc = (unsigned char)c;
+                        r += '\\';
+                        r += (char)('0' + ((uc >> 6) & 7));
+                        r += (char)('0' + ((uc >> 3) & 7));
+                        r += (char)('0' + (uc & 7));
                     } else r += c;
             }
         }
         return r;
     }
 
-    void emit_token_kinds(std::ostream& out) {
+    void emit_token_kinds(Buf out) {
         out << "#ifndef YYTOKENTYPE\n# define YYTOKENTYPE\n";
         out << "  enum yytokentype {\n";
         out << "    YYEMPTY = -2,\n";
@@ -1563,7 +1579,7 @@ private:
         }
     }
 
-    void emit_value_type(std::ostream& out) {
+    void emit_value_type(Buf out) {
         out << "#if !defined YYSTYPE && !defined YYSTYPE_IS_DECLARED\n";
         if (g_.has_union) {
             if (!opts_.no_lines)
@@ -1586,7 +1602,7 @@ private:
         out << "#endif\n";
     }
 
-    void emit_constants(std::ostream& out) {
+    void emit_constants(Buf out) {
         out << "YYSTYPE yylval;\nint yychar;\nint yynerrs;\n";
         out << "#ifndef YYDEBUG\n# define YYDEBUG 0\n#endif\n";
         out << "#if YYDEBUG\nint yydebug;\n#endif\n";
@@ -1606,7 +1622,7 @@ private:
     }
 
     template <class T>
-    void emit_array(std::ostream& out, const char* type, const char* name, const std::vector<T>& v) {
+    void emit_array(Buf out, const char* type, const char* name, const std::vector<T>& v) {
         out << "static const " << type << " " << name << "[] = {\n";
         if (v.empty()) out << "  0\n};\n";
         else {
@@ -1620,11 +1636,11 @@ private:
         }
     }
 
-    void emit_translation_table(std::ostream& out) {
+    void emit_translation_table(Buf out) {
         emit_array(out, "short", "yytranslate", l_.translate_table());
     }
 
-    void emit_compressed_tables(std::ostream& out) {
+    void emit_compressed_tables(Buf out) {
         // Layout: per-state row of nT entries appended to yytable/yycheck.
         // yypact[s] = base offset OR NINF (default-only).
         // For state s and token t: yytable[base+t] holds action; yycheck[base+t] = t IFF
@@ -1703,7 +1719,7 @@ private:
         emit_array(out, "short", "yycheck", yycheck);
     }
 
-    void emit_misc_tables(std::ostream& out) {
+    void emit_misc_tables(Buf out) {
         emit_array(out, "short", "yydefact", l_.default_reductions());
         emit_array(out, "short", "yystos", l_.stos_internal());
         // yyr1: lhs internal per rule
@@ -1731,7 +1747,7 @@ private:
         out << "  0\n};\n";
     }
 
-    void emit_yyerror_default(std::ostream& out) {
+    void emit_yyerror_default(Buf out) {
         out <<
             "#if !defined YYERROR_USER_PROVIDED\n"
             "#if defined(__GNUC__) || defined(__clang__)\n"
@@ -1741,7 +1757,7 @@ private:
             "#endif\n";
     }
 
-    void emit_driver(std::ostream& out) {
+    void emit_driver(Buf out) {
         out <<
 R"(extern int yylex(void);
 #define YYTRANSLATE(c) ((0 <= (c) && (c) <= YYMAXUTOK) ? yytranslate[c] : 257)
@@ -1827,7 +1843,7 @@ yyreduce:
 )";
     }
 
-    void emit_action_switch(std::ostream& out) {
+    void emit_action_switch(Buf out) {
         for (int i = 1; i < l_.n_rules(); i++) {
             const Production& p = l_.prod(i);
             if (p.action.empty()) continue;
@@ -1875,9 +1891,8 @@ yyreduce:
                 while (k < s.size() && ch_isdigit((unsigned char)s[k])) k++;
                 int n = std::atoi(s.substr(j, k - j).c_str());
                 int offset = n - eff_rhs_size;
-                char b[32]; std::snprintf(b, sizeof(b), "%d", offset);
                 out += "(yyvsp[";
-                out += b;
+                out += std::to_string(offset);
                 out += "]";
                 if (!tag.empty()) out += "." + tag;
                 else if (g_.has_union && n >= 1 && n <= (int)p.rhs_tags.size()) {
@@ -1903,9 +1918,8 @@ yyreduce:
                     if (p.rhs_names[idx] == nm && !nm.empty()) { found = idx; break; }
                 if (found >= 0) {
                     int offset = (found + 1) - (int)p.rhs.size();
-                    char b[32]; std::snprintf(b, sizeof(b), "%d", offset);
                     out += "(yyvsp[";
-                    out += b;
+                    out += std::to_string(offset);
                     out += "]";
                     if (!tag.empty()) out += "." + tag;
                     else if (g_.has_union && !p.rhs_tags[found].empty())
@@ -1919,7 +1933,7 @@ yyreduce:
         return out;
     }
 
-    void emit_driver_tail(std::ostream& out) {
+    void emit_driver_tail(Buf out) {
         out <<
 R"(    }
     yyssp -= yylen;
@@ -2007,11 +2021,11 @@ static int run(int argc, char** argv) {
         else if (a == "-v" || a == "--verbose") opts.verbose = true;
         else if (a == "-t" || a == "--debug") opts.debug = true;
         else if (a == "-V" || a == "--version") {
-            std::printf("yacc.cpp 0.1.0 (bison-compatible parser generator)\n");
+            write_stdout("yacc.cpp 0.1.0 (bison-compatible parser generator)\n");
             return 0;
         }
         else if (a == "-h" || a == "--help") {
-            std::printf("Usage: yacc [OPTION]... FILE\n");
+            write_stdout("Usage: yacc [OPTION]... FILE\n");
             return 0;
         }
         else if (starts("-W")) {}
@@ -2032,7 +2046,7 @@ static int run(int argc, char** argv) {
     }
     if (input.empty()) fatal("no input file specified");
 
-    string src = read_file(input);
+    string src = load_input_file(input);
     Grammar g;
     GrammarParser gp(std::move(src), input, g, opts);
     if (!defines_path_arg.empty()) opts.defines_path = defines_path_arg;
@@ -2063,20 +2077,21 @@ static int run(int argc, char** argv) {
     }
     if (!opts.defines_path.empty()) headerpath = opts.defines_path;
 
-    std::ofstream out(outpath, std::ios::binary);
-    if (!out) fatalf("cannot open output '%s'", outpath.c_str());
-    std::unique_ptr<std::ofstream> hdr;
-    if (opts.want_header) {
-        hdr = std::make_unique<std::ofstream>(headerpath, std::ios::binary);
-        if (!*hdr) fatalf("cannot open header '%s'", headerpath.c_str());
-    }
+    std::string out_s, hdr_s;
+    Buf out_buf{out_s};
+    Buf hdr_buf{hdr_s};
     Emitter em(g, la, opts);
-    em.emit(out, hdr.get());
+    em.emit(out_buf, opts.want_header ? &hdr_buf : nullptr);
+
+    if (!write_file(outpath, out_s))
+        fatalf("cannot write output '{}'", outpath);
+    if (opts.want_header && !write_file(headerpath, hdr_s))
+        fatalf("cannot write header '{}'", headerpath);
 
     if (la.sr_conflicts() > 0)
-        std::fprintf(stderr, "yacc: %d shift/reduce conflict(s)\n", la.sr_conflicts());
+        write_stderr(std::format("yacc: {} shift/reduce conflict(s)\n", la.sr_conflicts()));
     if (la.rr_conflicts() > 0)
-        std::fprintf(stderr, "yacc: %d reduce/reduce conflict(s)\n", la.rr_conflicts());
+        write_stderr(std::format("yacc: {} reduce/reduce conflict(s)\n", la.rr_conflicts()));
     return 0;
 }
 
@@ -2091,24 +2106,23 @@ int fuzz_run_buffer(const char* data, size_t len) {
         gp.parse();
         LALR la(g);
         la.build();
-        std::ostringstream out;
+        std::string out_s;
+        Buf out_buf{out_s};
         Emitter em(g, la, opts);
-        em.emit(out, nullptr);
+        em.emit(out_buf, nullptr);
         return 0;
     } catch (const YaccError&) { return 1; }
     catch (const std::exception&) { return 2; }
     catch (...) { return 3; }
 }
 
-} // namespace yacc
-
-#ifndef YACC_CPP_FUZZ_TARGET
-int main(int argc, char** argv) {
+int yacc_main(int argc, char** argv) {
     try {
-        return yacc::run(argc, argv);
-    } catch (const yacc::YaccError& e) {
-        std::fprintf(stderr, "yacc: error: %s\n", e.what());
+        return run(argc, argv);
+    } catch (const YaccError& e) {
+        write_stderr(std::string("yacc: error: ") + e.what() + "\n");
         return 1;
     }
 }
-#endif
+
+} // namespace yacc

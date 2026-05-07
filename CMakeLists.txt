@@ -38,7 +38,14 @@ if(YACC_CPP_ASAN)
     add_link_options(-fsanitize=address,undefined)
 endif()
 
-add_executable(yacc src/yacc.cpp)
+# Select exactly one platform layer at build time -- no #ifdefs in code.
+if(WIN32)
+    set(YACC_PLATFORM_SRC src/platform_win32.cpp)
+else()
+    set(YACC_PLATFORM_SRC src/platform_posix.cpp)
+endif()
+
+add_executable(yacc src/yacc.cpp ${YACC_PLATFORM_SRC})
 target_include_directories(yacc PRIVATE src)
 
 # Allow tests to find binary cross-platform

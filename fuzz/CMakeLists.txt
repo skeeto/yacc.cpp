@@ -5,8 +5,10 @@ if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     message(FATAL_ERROR "YACC_CPP_FUZZ requires Clang")
 endif()
 
-add_executable(yacc_fuzz fuzz_target.cpp)
-target_compile_definitions(yacc_fuzz PRIVATE YACC_CPP_FUZZ_TARGET)
+# Fuzzer pulls in the POSIX platform layer (libFuzzer is POSIX-only here)
+# but suppresses its main() so libFuzzer can supply the entry point.
+add_executable(yacc_fuzz fuzz_target.cpp ${CMAKE_SOURCE_DIR}/src/platform_posix.cpp)
+target_compile_definitions(yacc_fuzz PRIVATE YACC_CPP_FUZZ_TARGET YACC_CPP_NO_MAIN)
 target_compile_options(yacc_fuzz PRIVATE
     -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer -g -O1)
 target_link_options(yacc_fuzz PRIVATE
