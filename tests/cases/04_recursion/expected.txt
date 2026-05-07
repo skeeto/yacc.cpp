@@ -1,0 +1,4 @@
+got 10 sum=10
+got 20 sum=30
+got 30 sum=60
+got 5 sum=65

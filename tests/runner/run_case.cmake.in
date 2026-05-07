@@ -1,0 +1,115 @@
+# Run one test case. Variables (passed via -D):
+#   CASE_DIR     - path to test case
+#   WORK_DIR     - scratch build dir
+#   GEN          - "bison" or "yacc"
+#   GEN_BIN      - generator executable
+#   C_COMPILER   - C compiler
+
+file(MAKE_DIRECTORY ${WORK_DIR})
+
+# Read optional options.txt
+set(EXTRA_OPTS "")
+if(EXISTS ${CASE_DIR}/options.txt)
+    file(STRINGS ${CASE_DIR}/options.txt EXTRA_OPTS_LINES)
+    foreach(L ${EXTRA_OPTS_LINES})
+        string(STRIP "${L}" L)
+        if(L)
+            list(APPEND EXTRA_OPTS ${L})
+        endif()
+    endforeach()
+endif()
+
+# Bison-specific options to silence yacc warnings (we want to focus on parser correctness)
+if(GEN STREQUAL "bison")
+    list(PREPEND EXTRA_OPTS "-Wno-yacc")
+endif()
+
+# Generate parser
+file(COPY ${CASE_DIR}/grammar.y DESTINATION ${WORK_DIR})
+
+set(OUTPUT_C ${WORK_DIR}/grammar.tab.c)
+set(OUTPUT_H ${WORK_DIR}/grammar.tab.h)
+
+execute_process(
+    COMMAND ${GEN_BIN} -d -o ${OUTPUT_C} ${EXTRA_OPTS} ${WORK_DIR}/grammar.y
+    WORKING_DIRECTORY ${WORK_DIR}
+    RESULT_VARIABLE GEN_RC
+    OUTPUT_VARIABLE GEN_OUT
+    ERROR_VARIABLE  GEN_ERR
+)
+if(NOT GEN_RC EQUAL 0)
+    message(FATAL_ERROR "${GEN} failed (rc=${GEN_RC}):\nstdout: ${GEN_OUT}\nstderr: ${GEN_ERR}")
+endif()
+
+if(NOT EXISTS ${OUTPUT_C})
+    message(FATAL_ERROR "${GEN} did not produce ${OUTPUT_C}")
+endif()
+
+# Compile driver + generated parser
+set(DRIVER_C ${CASE_DIR}/driver.c)
+if(NOT EXISTS ${DRIVER_C})
+    message(FATAL_ERROR "missing driver.c in ${CASE_DIR}")
+endif()
+file(COPY ${DRIVER_C} DESTINATION ${WORK_DIR})
+
+set(EXE ${WORK_DIR}/test_prog)
+if(WIN32)
+    set(EXE ${EXE}.exe)
+endif()
+
+execute_process(
+    COMMAND ${C_COMPILER} -std=c11 -O0 -g -Wno-unused -Wno-implicit-fallthrough
+            -Wno-deprecated-non-prototype
+            -I${WORK_DIR} ${WORK_DIR}/grammar.tab.c ${WORK_DIR}/driver.c -o ${EXE}
+    RESULT_VARIABLE CC_RC
+    OUTPUT_VARIABLE CC_OUT
+    ERROR_VARIABLE  CC_ERR
+)
+if(NOT CC_RC EQUAL 0)
+    message(FATAL_ERROR "compile failed (rc=${CC_RC}):\nstdout: ${CC_OUT}\nstderr: ${CC_ERR}")
+endif()
+
+# Run with input
+set(STDIN_FILE ${CASE_DIR}/input.txt)
+set(EXPECTED ${CASE_DIR}/expected.txt)
+if(NOT EXISTS ${EXPECTED})
+    message(FATAL_ERROR "missing expected.txt")
+endif()
+file(READ ${EXPECTED} EXPECTED_CONTENT)
+
+if(EXISTS ${STDIN_FILE})
+    execute_process(
+        COMMAND ${EXE}
+        INPUT_FILE ${STDIN_FILE}
+        OUTPUT_VARIABLE ACTUAL
+        ERROR_VARIABLE ACTUAL_ERR
+        RESULT_VARIABLE RUN_RC
+        TIMEOUT 30
+    )
+else()
+    execute_process(
+        COMMAND ${EXE}
+        OUTPUT_VARIABLE ACTUAL
+        ERROR_VARIABLE ACTUAL_ERR
+        RESULT_VARIABLE RUN_RC
+        TIMEOUT 30
+    )
+endif()
+
+# Optionally compare with stderr too
+if(EXISTS ${CASE_DIR}/expected_combined.txt)
+    set(EXPECTED_FILE ${CASE_DIR}/expected_combined.txt)
+    file(READ ${EXPECTED_FILE} EXPECTED_CONTENT)
+    set(ACTUAL "${ACTUAL}${ACTUAL_ERR}")
+endif()
+
+# Normalize line endings and trailing whitespace
+string(REPLACE "\r\n" "\n" ACTUAL "${ACTUAL}")
+string(REPLACE "\r\n" "\n" EXPECTED_CONTENT "${EXPECTED_CONTENT}")
+# Trim trailing newline whitespace differences
+string(REGEX REPLACE "[\n ]+$" "" ACTUAL "${ACTUAL}")
+string(REGEX REPLACE "[\n ]+$" "" EXPECTED_CONTENT "${EXPECTED_CONTENT}")
+
+if(NOT "${ACTUAL}" STREQUAL "${EXPECTED_CONTENT}")
+    message(FATAL_ERROR "Output mismatch (run_rc=${RUN_RC}):\n--- expected ---\n${EXPECTED_CONTENT}\n--- actual ---\n${ACTUAL}\n--- stderr ---\n${ACTUAL_ERR}\n")
+endif()

@@ -1,0 +1,5 @@
+int: 10
+int: 6
+str: hello
+str: world
+int: 150

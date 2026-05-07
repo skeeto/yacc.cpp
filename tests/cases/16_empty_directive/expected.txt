@@ -1,0 +1,7 @@
+empty
+A
+B
+A
+A
+B
+done
