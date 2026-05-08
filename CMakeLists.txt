@@ -52,9 +52,32 @@ target_include_directories(yacc PRIVATE src)
 set_target_properties(yacc PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
+# Yacc-compat library.  Linked via `-ly` on POSIX.  Contains a default
+# main() that just runs yyparse(), and a default yyerror() that prints
+# to stderr -- the same one-screen liby.a shipped with traditional yacc
+# and Bison.  The generated parser already provides a weak yyerror, so
+# this library is mostly useful when you want the default main() too.
+add_library(y STATIC lib/liby.c)
+set_target_properties(y PROPERTIES
+    OUTPUT_NAME y
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+
 enable_testing()
 add_subdirectory(tests)
 
 if(YACC_CPP_FUZZ)
     add_subdirectory(fuzz)
 endif()
+
+# ---- install rules ----
+include(GNUInstallDirs)
+
+install(TARGETS yacc
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS y
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+# Project documentation.
+install(FILES
+        ${CMAKE_SOURCE_DIR}/TODO.md
+        ${CMAKE_SOURCE_DIR}/docs/yacc-howto.md
+    DESTINATION ${CMAKE_INSTALL_DOCDIR})

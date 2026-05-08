@@ -158,29 +158,6 @@ Bison can produce D and Java parsers via the `lalr1.d` and `lalr1.java`
 skeletons. Only meaningful after the C++ skeleton lands and the skeleton
 interface is properly factored.
 
-## Runtime / linking
-
-### Optional `-ly` compatibility library
-
-Bison itself doesn't emit `main()` or `yyerror()`; users either supply both
-themselves or link `-ly` (`liby.a`), historically distributed with yacc. The
-library is a one-screen affair:
-
-```c
-int  main(void)                  { return yyparse(); }
-void yyerror(const char *s)      { fprintf(stderr, "%s\n", s); }
-```
-
-yacc.cpp's outputs already include a `__attribute__((weak)) yyerror` so the
-user only needs to supply `main`, but nothing emits a `main()`. For drop-in
-replacement of build systems that pass `-ly` to the linker, ship a
-`libyacc_y.a` (CMake static library target) containing the same one-screen
-defaults as Bison's `liby`. No header file required — both symbols are
-already declared in the generated header / weak in the source.
-
-The existing test suite doesn't need `-ly` because each `driver.c` defines
-its own `main()` and `yyerror()`.
-
 ## Robustness
 
 ### Differential testing against multiple Bison versions
