@@ -1,0 +1,4 @@
+err: syntax error
+free y
+free x
+recovered

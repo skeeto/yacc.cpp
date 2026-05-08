@@ -168,6 +168,21 @@ struct Grammar {
     // Stored as raw "type name" strings, one per brace block.
     vector<string> parse_params;
     vector<string> lex_params;
+
+    // %destructor / %printer: per-symbol code body.  Defaults indexed by tag,
+    // with "*" for "all typed symbols" and "" for "all untyped symbols".
+    std::map<int, string> destructor_by_sym;
+    std::map<int, string> printer_by_sym;
+    std::map<string, string> destructor_default;  // tag -> body; tag is "<>", "<*>", or a real tag
+    std::map<string, string> printer_default;
+
+    // %initial-action — body to emit at the top of yyparse().
+    string initial_action;
+
+    // %define parse.trace = true (or -t flag).  Enables YYDEBUG=1 by default
+    // and emits the YYDPRINTF / YY_SYMBOL_PRINT / YY_REDUCE_PRINT / YY_STACK_PRINT
+    // helpers and calls.
+    bool parse_trace = false;
     string api_prefix;
     string token_prefix;
     int expected_sr = -1;
@@ -679,12 +694,60 @@ private:
                 return;
             }
             case Tok::PercentDestructor:
-            case Tok::PercentPrinter:
+            case Tok::PercentPrinter: {
+                bool is_destructor = (t.kind == Tok::PercentDestructor);
+                advance();
+                // Optional <tag> applies the body to one specific tag.
+                string explicit_tag;
+                bool has_explicit_tag = false;
+                if (at(Tok::Tag)) { explicit_tag = peek_.text; has_explicit_tag = true; advance(); }
+                if (!at(Tok::BraceBlock))
+                    fatalf("%{} requires a {{ body }} at line {}",
+                           (is_destructor ? "destructor" : "printer"), peek_.line);
+                string body = peek_.text;
+                advance();
+                // Followed by either symbol identifiers/literals or <tag> selectors
+                // (<*> for "all typed", <> for "all untyped", <name> for one tag).
+                bool got_target = false;
+                while (true) {
+                    if (at(Tok::Identifier)) {
+                        int idx = g_.find(peek_.text);
+                        if (idx < 0) idx = g_.intern(peek_.text, false);
+                        if (is_destructor) g_.destructor_by_sym[idx] = body;
+                        else g_.printer_by_sym[idx] = body;
+                        advance(); got_target = true;
+                    } else if (at(Tok::CharLit)) {
+                        int idx = sym_of_char(peek_);
+                        if (is_destructor) g_.destructor_by_sym[idx] = body;
+                        else g_.printer_by_sym[idx] = body;
+                        advance(); got_target = true;
+                    } else if (at(Tok::StrLit)) {
+                        int idx = sym_of_strlit(peek_.text);
+                        if (is_destructor) g_.destructor_by_sym[idx] = body;
+                        else g_.printer_by_sym[idx] = body;
+                        advance(); got_target = true;
+                    } else if (at(Tok::Tag)) {
+                        // <tag>, <*>, <>
+                        string tag = peek_.text;
+                        if (is_destructor) g_.destructor_default[tag] = body;
+                        else g_.printer_default[tag] = body;
+                        advance(); got_target = true;
+                    } else break;
+                }
+                if (!got_target && has_explicit_tag) {
+                    // %destructor <tag> { body }   (no symbol list)
+                    if (is_destructor) g_.destructor_default[explicit_tag] = body;
+                    else g_.printer_default[explicit_tag] = body;
+                }
+                (void)explicit_tag;
+                return;
+            }
             case Tok::PercentInitialAction:
                 advance();
-                if (at(Tok::Tag)) advance();
-                if (at(Tok::BraceBlock)) advance();
-                while (at(Tok::Identifier) || at(Tok::CharLit) || at(Tok::StrLit)) advance();
+                if (at(Tok::BraceBlock)) {
+                    g_.initial_action = peek_.text;
+                    advance();
+                }
                 return;
             default:
                 fatalf("unexpected '{}' at line {}", t.text.c_str(), t.line);
@@ -713,6 +776,9 @@ private:
             else if (name == "api.token.prefix") g_.token_prefix = v;
             else if (name == "parse.error") g_.parse_error_mode = v;
             else if (name == "api.pure") g_.api_pure = v;
+            else if (name == "parse.trace") {
+                g_.parse_trace = (v == "true" || v == "1" || v == "on");
+            }
             advance();
         } else if (at(Tok::BraceBlock)) {
             string v = "{" + peek_.text + "}";
@@ -721,6 +787,7 @@ private:
         } else {
             // %define NAME (no value) — treat as "true".
             if (name == "api.pure") g_.api_pure = "true";
+            else if (name == "parse.trace") g_.parse_trace = true;
         }
     }
 
@@ -1608,7 +1675,7 @@ public:
         if (hdr) {
             *hdr << "#ifndef YY_TAB_H_INCLUDED\n# define YY_TAB_H_INCLUDED\n";
             *hdr << "#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
-            *hdr << "#ifndef YYDEBUG\n# define YYDEBUG 0\n#endif\n";
+            *hdr << "#ifndef YYDEBUG\n# define YYDEBUG " << (g_.parse_trace ? 1 : 0) << "\n#endif\n";
             *hdr << "#if YYDEBUG\nextern int yydebug;\n#endif\n";
             if (!g_.prologue_requires.empty())
                 *hdr << "/* %code requires */\n" << g_.prologue_requires << "\n";
@@ -1641,6 +1708,9 @@ public:
         emit_compressed_tables(out);
         emit_misc_tables(out);
         emit_yyerror_default(out);
+        emit_destructor(out);
+        emit_printer(out);
+        emit_trace_macros(out);
         emit_driver(out);
         emit_action_switch(out);
         emit_driver_tail(out);
@@ -1751,7 +1821,7 @@ private:
             if (g_.want_locations)
                 out << "YYLTYPE yylloc;\n";
         }
-        out << "#ifndef YYDEBUG\n# define YYDEBUG 0\n#endif\n";
+        out << "#ifndef YYDEBUG\n# define YYDEBUG " << (g_.parse_trace ? 1 : 0) << "\n#endif\n";
         out << "#if YYDEBUG\nint yydebug;\n#endif\n";
         out << "#define YYNTOKENS " << l_.n_terminals() << "\n";
         out << "#define YYNNTS " << l_.n_nonterminals() << "\n";
@@ -1997,6 +2067,196 @@ private:
         }
     }
 
+    // Build the body of a yydestruct/yysymbol_print dispatcher: a switch on
+    // internal symbol kind that runs the matching user code body.  When no
+    // sym-specific body is registered, fall back to a tag-keyed default
+    // (<tag> for typed, <*> for any-typed, <> for untyped).
+    string dispatcher_body(const std::map<int, string>& by_sym,
+                            const std::map<string, string>& by_tag) const {
+        string out;
+        out += "    switch (yykind) {\n";
+        for (int internal = 0; internal < l_.n_total_syms(); internal++) {
+            int sym = l_.internal_to_sym(internal);
+            string body;
+            auto it = by_sym.find(sym);
+            if (it != by_sym.end()) body = it->second;
+            else {
+                const string& tag = g_.syms[sym].type_tag;
+                if (!tag.empty()) {
+                    auto t = by_tag.find(tag);
+                    if (t == by_tag.end()) t = by_tag.find("*");
+                    if (t == by_tag.end()) t = by_tag.find("<*>");
+                    if (t != by_tag.end()) body = t->second;
+                } else {
+                    auto t = by_tag.find("");
+                    if (t == by_tag.end()) t = by_tag.find("<>");
+                    if (t != by_tag.end()) body = t->second;
+                }
+            }
+            if (body.empty()) continue;
+            out += "    case "; out += std::to_string(internal); out += ":\n";
+            out += "      { "; out += body; out += " }\n";
+            out += "      break;\n";
+        }
+        out += "    default: break;\n";
+        out += "    }\n";
+        return out;
+    }
+
+    bool any_destructor() const {
+        return !g_.destructor_by_sym.empty() || !g_.destructor_default.empty();
+    }
+    bool any_printer() const {
+        return !g_.printer_by_sym.empty() || !g_.printer_default.empty();
+    }
+
+    void emit_destructor(Buf out) {
+        if (!any_destructor()) return;
+        out << "static void yydestruct(const char *yymsg, int yykind, "
+               "YYSTYPE *yyvaluep";
+        if (g_.want_locations) out << ", YYLTYPE *yylocationp";
+        for (auto& p : g_.parse_params) out << ", " << p;
+        out << ") {\n";
+        out << "    (void)yymsg; (void)yyvaluep;\n";
+        if (g_.want_locations) out << "    (void)yylocationp;\n";
+        for (auto& p : g_.parse_params) {
+            size_t end = p.find_last_not_of(" \t\r\n");
+            if (end == string::npos) continue;
+            size_t start = end;
+            while (start > 0 && (ch_isalnum((unsigned char)p[start - 1]) || p[start - 1] == '_'))
+                start--;
+            out << "    (void)" << p.substr(start, end - start + 1) << ";\n";
+        }
+        // The user's body may use $$ and @$; rewrite those to (*yyvaluep)
+        // and (*yylocationp).  Translate via a synthetic Production whose
+        // tag context comes from the symbol when emitted.
+        out << "#define yyx_value(t) ((*yyvaluep)" << ".t)\n";
+        out << "    switch (yykind) {\n";
+        for (int internal = 0; internal < l_.n_total_syms(); internal++) {
+            int sym = l_.internal_to_sym(internal);
+            string body;
+            auto it = g_.destructor_by_sym.find(sym);
+            if (it != g_.destructor_by_sym.end()) body = it->second;
+            else {
+                const string& tag = g_.syms[sym].type_tag;
+                if (!tag.empty()) {
+                    auto t = g_.destructor_default.find(tag);
+                    if (t == g_.destructor_default.end()) t = g_.destructor_default.find("*");
+                    if (t != g_.destructor_default.end()) body = t->second;
+                } else {
+                    auto t = g_.destructor_default.find("");
+                    if (t != g_.destructor_default.end()) body = t->second;
+                }
+            }
+            if (body.empty()) continue;
+            // Translate $$ to (*yyvaluep) (with tag if known) and @$ to (*yylocationp).
+            string translated = translate_destructor_body(body, g_.syms[sym].type_tag);
+            out << "    case " << internal << ":\n";
+            out << "      { " << translated << " }\n";
+            out << "      break;\n";
+        }
+        out << "    default: break;\n";
+        out << "    }\n";
+        out << "#undef yyx_value\n";
+        out << "}\n";
+    }
+
+    void emit_printer(Buf out) {
+        if (!any_printer()) return;
+        out << "static void yysymbol_print(FILE *yyo, int yykind, "
+               "YYSTYPE *yyvaluep";
+        if (g_.want_locations) out << ", YYLTYPE *yylocationp";
+        out << ") {\n";
+        out << "    (void)yyvaluep;\n";
+        if (g_.want_locations) out << "    (void)yylocationp;\n";
+        out << "    switch (yykind) {\n";
+        for (int internal = 0; internal < l_.n_total_syms(); internal++) {
+            int sym = l_.internal_to_sym(internal);
+            string body;
+            auto it = g_.printer_by_sym.find(sym);
+            if (it != g_.printer_by_sym.end()) body = it->second;
+            else {
+                const string& tag = g_.syms[sym].type_tag;
+                if (!tag.empty()) {
+                    auto t = g_.printer_default.find(tag);
+                    if (t == g_.printer_default.end()) t = g_.printer_default.find("*");
+                    if (t != g_.printer_default.end()) body = t->second;
+                } else {
+                    auto t = g_.printer_default.find("");
+                    if (t != g_.printer_default.end()) body = t->second;
+                }
+            }
+            if (body.empty()) continue;
+            string translated = translate_destructor_body(body, g_.syms[sym].type_tag);
+            out << "    case " << internal << ":\n";
+            out << "      { " << translated << " }\n";
+            out << "      break;\n";
+        }
+        out << "    default: break;\n";
+        out << "    }\n";
+        out << "}\n";
+    }
+
+    // Tiny version of translate_action specialized for destructor/printer
+    // bodies, where the only parser-generator references are $$ and @$.
+    string translate_destructor_body(const string& s, const string& tag) {
+        string out;
+        size_t i = 0;
+        while (i < s.size()) {
+            char c = s[i];
+            if (c == '"' || c == '\'') {
+                char quote = c;
+                out += c; i++;
+                while (i < s.size()) {
+                    if (s[i] == '\\' && i + 1 < s.size()) {
+                        out += s[i++]; out += s[i++]; continue;
+                    }
+                    out += s[i];
+                    if (s[i] == quote) { i++; break; }
+                    i++;
+                }
+                continue;
+            }
+            if (c == '$' && i + 1 < s.size() && s[i + 1] == '$') {
+                if (g_.has_union && !tag.empty()) {
+                    out += "((*yyvaluep)."; out += tag; out += ")";
+                } else {
+                    out += "(*yyvaluep)";
+                }
+                i += 2; continue;
+            }
+            if (c == '@' && g_.want_locations && i + 1 < s.size() && s[i + 1] == '$') {
+                out += "(*yylocationp)";
+                i += 2; continue;
+            }
+            out += c; i++;
+        }
+        return out;
+    }
+
+    void emit_trace_macros(Buf out) {
+        if (!g_.parse_trace) return;
+        out << "#ifndef YYDEBUG\n# define YYDEBUG 1\n#endif\n";
+        out << "#if YYDEBUG\n";
+        out << "# define YYDPRINTF(Args) do { if (yydebug) fprintf Args; } while (0)\n";
+        out << "# define YY_SYMBOL_PRINT(Title, Kind, Val, Loc) \\\n";
+        out << "    do { if (yydebug) { fprintf(stderr, \"%s \", Title); ";
+        if (any_printer())
+            out << "yysymbol_print(stderr, Kind, Val" << (g_.want_locations ? ", Loc" : "") << "); ";
+        else
+            out << "(void)(Kind); (void)(Val); ";
+        out << "fprintf(stderr, \"\\n\"); } } while (0)\n";
+        out << "# define YY_REDUCE_PRINT(Rule) \\\n";
+        out << "    do { if (yydebug) fprintf(stderr, \"Reducing stack by rule %d\\n\", Rule); } while (0)\n";
+        out << "# define YY_STACK_PRINT(B, T) do {} while (0)\n";
+        out << "#else\n";
+        out << "# define YYDPRINTF(Args) do {} while (0)\n";
+        out << "# define YY_SYMBOL_PRINT(T, K, V, L) do {} while (0)\n";
+        out << "# define YY_REDUCE_PRINT(R) do {} while (0)\n";
+        out << "# define YY_STACK_PRINT(B, T) do {} while (0)\n";
+        out << "#endif\n";
+    }
+
     void emit_driver(Buf out) {
         const bool L = g_.want_locations;
         const bool P = pure();
@@ -2068,6 +2328,14 @@ private:
         out << "    *yyssp = 0;\n";
         out << "    yychar = -2;\n";
         out << "    yynerrs = 0;\n";
+        if (!g_.initial_action.empty()) {
+            // Run user's %initial-action.  $$ and @$ aren't really meaningful
+            // here, so we emit it verbatim (consistent with bison's behavior
+            // — references resolve to the initial yyval/yyloc).
+            out << "    {\n";
+            if (!opts_.no_lines) out << "#line 1 \"" << g_.source_file << "\"\n";
+            out << g_.initial_action << "\n    }\n";
+        }
         out << "    goto yysetstate;\n";
         out << "\n";
         out << "yynewstate:\n";
@@ -2098,7 +2366,15 @@ private:
         out << "yybackup:\n";
         out << "    yyn = yypact[yystate];\n";
         out << "    if (yypact_value_is_default(yyn)) goto yydefault;\n";
+        if (g_.parse_trace) out << "    if (yychar == -2) YYDPRINTF((stderr, \"Reading a token\\n\"));\n";
         out << "    if (yychar == -2) yychar = yylex(" << yylex_call_args() << ");\n";
+        if (g_.parse_trace) {
+            out << "    if (yychar <= 0)\n";
+            out << "        YYDPRINTF((stderr, \"Now at end of input.\\n\"));\n";
+            out << "    else\n";
+            out << "        YY_SYMBOL_PRINT(\"Next token is\", YYTRANSLATE(yychar), &yylval, "
+                << (L ? "&yylloc" : "(void*)0") << ");\n";
+        }
         out << "    if (yychar <= 0) { yychar = 0; yytoken = 0; }\n";
         out << "    else if (yychar == 256) { yychar = 257; yytoken = YYTRANSLATE(257); goto yyerrlab1; }\n";
         out << "    else yytoken = YYTRANSLATE(yychar);\n";
@@ -2112,6 +2388,10 @@ private:
         out << "        goto yyreduce;\n";
         out << "    }\n";
         out << "    if (yyerrstatus) yyerrstatus--;\n";
+        if (g_.parse_trace) {
+            out << "    YY_SYMBOL_PRINT(\"Shifting\", yytoken, &yylval, "
+                << (L ? "&yylloc" : "(void*)0") << ");\n";
+        }
         out << "    yystate = yyn;\n";
         out << "    *++yyvsp = yylval;\n";
         if (L) out << "    *++yylsp = yylloc;\n";
@@ -2128,6 +2408,8 @@ private:
         out << "    if (yylen) yyval = yyvsp[1 - yylen];\n";
         out << "    else memset(&yyval, 0, sizeof(yyval));\n";
         if (L) out << "    YYLLOC_DEFAULT(yyloc, (yylsp - yylen), yylen);\n";
+        if (g_.parse_trace)
+            out << "    YY_REDUCE_PRINT(yyn);\n";
         out << "    switch (yyn) {\n";
     }
 
@@ -2348,6 +2630,11 @@ private:
         out << "            }\n";
         out << "        }\n";
         out << "        if (yyssp == yyss) goto yyabortlab;\n";
+        if (any_destructor()) {
+            out << "        yydestruct(\"Error: popping\", yystos[*yyssp], yyvsp";
+            if (L) out << ", yylsp";
+            out << params_call(g_.parse_params) << ");\n";
+        }
         out << "        yyvsp--;\n";
         if (L) out << "        yylsp--;\n";
         out << "        yystate = *--yyssp;\n";
@@ -2425,6 +2712,7 @@ static int run(int argc, char** argv) {
     if (!defines_path_arg.empty()) opts.defines_path = defines_path_arg;
     if (!file_prefix.empty()) opts.file_prefix = file_prefix;
     gp.parse();
+    if (opts.debug) g.parse_trace = true;
     LALR la(g);
     la.build();
 
