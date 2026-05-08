@@ -1131,6 +1131,11 @@ public:
 
     int sym_to_internal(int s) const { return sym_to_internal_[s]; }
     int internal_to_sym(int i) const { return internal_to_sym_[i]; }
+
+    const State& state(int s) const { return states_[s]; }
+    const vector<int>& term_internals()    const { return term_internal_; }
+    const vector<int>& nonterm_internals() const { return nonterm_internal_; }
+    const Grammar& grammar() const { return g_; }
     int term_external_code(int internal) const { return term_codes_[internal]; }
     int term_external_max() const { return term_max_external_; }
     const vector<int>& translate_table() const { return translate_; }
@@ -2765,6 +2770,77 @@ private:
 };
 
 // ============================================================================
+// Verbose report (-v / --report=*) — Bison-compatible .output file.
+// ============================================================================
+
+static string write_report(const Grammar& g, const LALR& l) {
+    std::string s;
+    Buf out{s};
+    auto sym_name = [&](int internal) -> string {
+        int sym = l.internal_to_sym(internal);
+        if (sym == g.eof_sym) return "$end";
+        return g.syms[sym].display.empty() ? g.syms[sym].name : g.syms[sym].display;
+    };
+
+    out << "Terminals, with rules where they appear\n\n";
+    for (int i = 0; i < l.n_terminals(); i++) {
+        out << "    " << sym_name(i) << " ";
+        int sym = l.internal_to_sym(i);
+        if (g.syms[sym].code >= 0) out << "(" << g.syms[sym].code << ")";
+        out << "\n";
+    }
+    out << "\n\nNonterminals, with rules where they appear\n\n";
+    for (int i = l.n_terminals(); i < l.n_total_syms(); i++) {
+        out << "    " << sym_name(i) << "\n";
+    }
+    out << "\n\nGrammar\n\n";
+    for (int p = 0; p < l.n_rules(); p++) {
+        const auto& prod = l.prod(p);
+        out << "    " << p << " " << g.syms[prod.lhs].name << ":";
+        if (prod.rhs.empty()) out << " %empty";
+        for (int s : prod.rhs) out << " " << g.syms[s].display;
+        out << "\n";
+    }
+    out << "\n\n";
+
+    // Per-state listing.
+    for (int s = 0; s < l.n_states(); s++) {
+        out << "state " << s << "\n\n";
+        const State& st = l.state(s);
+        for (auto& it : st.items) {
+            const auto& prod = l.prod(it.prod);
+            out << "    " << it.prod << " " << g.syms[prod.lhs].name << ":";
+            for (size_t k = 0; k < prod.rhs.size(); k++) {
+                if (k == it.dot) out << " .";
+                out << " " << g.syms[prod.rhs[k]].display;
+            }
+            if (it.dot == prod.rhs.size()) out << " .";
+            out << "\n";
+        }
+        out << "\n";
+        // Actions per terminal.
+        for (int t = 0; t < l.n_terminals(); t++) {
+            int a = l.action(s, t);
+            if (a == 0) continue;
+            out << "    " << sym_name(t) << "  ";
+            if (a == LALR::ACCEPT) out << "accept\n";
+            else if (a == LALR::ERR_MARK) out << "error (nonassociative)\n";
+            else if (a > 0) out << "shift, and go to state " << (a - 1) << "\n";
+            else out << "reduce using rule " << (-a) << "\n";
+        }
+        // Gotos per nonterminal.
+        for (int nt = 0; nt < l.n_nonterminals(); nt++) {
+            int g_dst = l.goto_tab(s, nt);
+            if (g_dst == 0) continue;
+            int sym = l.internal_to_sym(l.n_terminals() + nt);
+            out << "    " << g.syms[sym].name << "  go to state " << (g_dst - 1) << "\n";
+        }
+        out << "\n";
+    }
+    return s;
+}
+
+// ============================================================================
 // CLI driver
 // ============================================================================
 
@@ -2858,6 +2934,21 @@ static int run(int argc, char** argv) {
         fatalf("cannot write output '{}'", outpath);
     if (opts.want_header && !write_file(headerpath, hdr_s))
         fatalf("cannot write header '{}'", headerpath);
+
+    // -v / --verbose: write a Bison-compatible .output report file with
+    // state listings, items, actions, and gotos.
+    if (opts.verbose) {
+        // Derive report path from the source file's basename.
+        string rpath;
+        size_t slash = input.find_last_of("/\\");
+        string fname = (slash == string::npos) ? input : input.substr(slash + 1);
+        size_t dot = fname.find_last_of('.');
+        string stem = (dot == string::npos) ? fname : fname.substr(0, dot);
+        rpath = stem + ".output";
+        string report = write_report(g, la);
+        if (!write_file(rpath, report))
+            fatalf("cannot write report '{}'", rpath);
+    }
 
     if (la.sr_conflicts() > 0)
         write_stderr(std::format("yacc: {} shift/reduce conflict(s)\n", la.sr_conflicts()));
