@@ -3549,6 +3549,29 @@ private:
     // Conflict actions live in two parallel arrays emitted earlier:
     //   yyglr_extra_state[i] / yyglr_extra_token[i] / yyglr_extra_action[i]
     void emit_glr_driver(Buf out) {
+        const bool L = g_.want_locations;
+        // YYLLOC_DEFAULT (and YYRHSLOC) are defined here too so locations
+        // work in GLR action bodies.  Same default as the deterministic
+        // driver; users may override by #define before %{ %}.
+        if (L) {
+            out << "#ifndef YYLLOC_DEFAULT\n";
+            out << "# define YYLLOC_DEFAULT(Cur, Rhs, N)                              \\\n";
+            out << "    do                                                            \\\n";
+            out << "      if (N) {                                                    \\\n";
+            out << "        (Cur).first_line   = YYRHSLOC(Rhs, 1).first_line;         \\\n";
+            out << "        (Cur).first_column = YYRHSLOC(Rhs, 1).first_column;       \\\n";
+            out << "        (Cur).last_line    = YYRHSLOC(Rhs, N).last_line;          \\\n";
+            out << "        (Cur).last_column  = YYRHSLOC(Rhs, N).last_column;        \\\n";
+            out << "      } else {                                                    \\\n";
+            out << "        (Cur).first_line   = (Cur).last_line   =                  \\\n";
+            out << "          YYRHSLOC(Rhs, 0).last_line;                             \\\n";
+            out << "        (Cur).first_column = (Cur).last_column =                  \\\n";
+            out << "          YYRHSLOC(Rhs, 0).last_column;                           \\\n";
+            out << "      }                                                           \\\n";
+            out << "    while (0)\n";
+            out << "#endif\n";
+            out << "#define YYRHSLOC(Rhs, K) ((Rhs)[K])\n";
+        }
         // Emit the alternate-action table.
         const auto& extras = l_.glr_extra_actions;
         // Sort by (state, token) for binary-search lookup.
@@ -3620,14 +3643,19 @@ private:
         out << "    int state;\n";
         out << "    int last_rule;\n";
         out << "    YYSTYPE value;\n";
+        if (L) out << "    YYLTYPE loc;\n";
         out << "    struct yyglr_node *prev;\n";
         out << "    int refcount;\n";
         out << "} yyglr_node;\n";
 
-        out << "static yyglr_node *yyglr_node_new(int state, int last_rule, YYSTYPE value, yyglr_node *prev) {\n";
+        out << "static yyglr_node *yyglr_node_new(int state, int last_rule, YYSTYPE value, ";
+        if (L) out << "YYLTYPE loc, ";
+        out << "yyglr_node *prev) {\n";
         out << "    yyglr_node *n = (yyglr_node*)malloc(sizeof(*n));\n";
         out << "    n->state = state; n->last_rule = last_rule;\n";
-        out << "    n->value = value; n->prev = prev;\n";
+        out << "    n->value = value;";
+        if (L) out << " n->loc = loc;";
+        out << " n->prev = prev;\n";
         out << "    n->refcount = 1;\n";
         out << "    if (prev) prev->refcount++;\n";
         out << "    return n;\n";
@@ -3692,12 +3720,22 @@ private:
         out << "}\n";
 
         // Action switch.  Same shape as the deterministic switch but
-        // uses a local yyvsp for resolved actions during reduce.
+        // uses a local yyvsp for resolved actions during reduce.  When
+        // %locations is on, the LHS yyloc is computed by the caller via
+        // YYLLOC_DEFAULT and passed in; the action body may further
+        // adjust it via @$.  yylsp points to the top RHS location so
+        // @N references work.
         out << "static YYSTYPE yyglr_run_action(int rule, YYSTYPE *vals_top";
+        if (L) out << ", YYLTYPE *locs_top, YYLTYPE *p_yyloc";
         for (auto& p : g_.parse_params) out << ", " << p;
         out << ") {\n";
         out << "    YYSTYPE yyval;\n";
         out << "    YYSTYPE *yyvsp = vals_top;\n";
+        if (L) {
+            out << "    YYLTYPE yyloc = *p_yyloc;\n";
+            out << "    YYLTYPE *yylsp = locs_top;\n";
+            out << "    (void)yylsp;\n";
+        }
         out << "    int yylen;\n";
         out << "    switch (rule) {\n";
         for (int i = 1; i < l_.n_rules(); i++) {
@@ -3710,11 +3748,12 @@ private:
             if (!p.action.empty()) {
                 out << "        { " << translate_action(p) << " }\n";
             }
-            out << "        return yyval;\n";
+            out << "        break;\n";
         }
-        out << "    default: break;\n";
+        out << "    default: memset(&yyval, 0, sizeof(yyval)); break;\n";
         out << "    }\n";
-        out << "    YYSTYPE z; memset(&z, 0, sizeof(z)); return z;\n";
+        if (L) out << "    *p_yyloc = yyloc;\n";
+        out << "    return yyval;\n";
         out << "}\n";
 
         // The driver itself.  Tops grow dynamically via realloc — no
@@ -3740,7 +3779,10 @@ private:
         out << "    yyglr_node **tops = (yyglr_node**)malloc(tops_cap * sizeof(*tops));\n";
         out << "    yyglr_node **next_tops = (yyglr_node**)malloc(next_cap * sizeof(*next_tops));\n";
         out << "    YYSTYPE init_val; memset(&init_val, 0, sizeof(init_val));\n";
-        out << "    tops[0] = yyglr_node_new(0, 0, init_val, NULL);\n";
+        if (L) out << "    YYLTYPE init_loc; memset(&init_loc, 0, sizeof(init_loc));\n";
+        out << "    tops[0] = yyglr_node_new(0, 0, init_val, ";
+        if (L) out << "init_loc, ";
+        out << "NULL);\n";
         out << "    int n_tops = 1;\n";
         out << "    yychar = -2;\n";
         out << "    yynerrs = 0;\n";
@@ -3766,7 +3808,9 @@ private:
         out << "                if (act > 0) {\n";
         out << "                    /* Shift to state act. */\n";
         out << "                    yyglr_grow(&next_tops, &next_cap, n_next + 1);\n";
-        out << "                    yyglr_node *n = yyglr_node_new(act, 0, yylval, top);\n";
+        out << "                    yyglr_node *n = yyglr_node_new(act, 0, yylval, ";
+        if (L) out << "yylloc, ";
+        out << "top);\n";
         out << "                    next_tops[n_next++] = n;\n";
         out << "                    progress = 1;\n";
         out << "                    did_shift = 1;\n";
@@ -3776,18 +3820,26 @@ private:
         out << "                    int len = yyr2[rule];\n";
         out << "                    yyglr_node *cur = top;\n";
         out << "                    YYSTYPE values[YYGLR_MAX_RHS];\n";
+        if (L) out << "                    YYLTYPE locs[YYGLR_MAX_RHS + 1];\n";
         out << "                    if (len >= YYGLR_MAX_RHS) { /* too deep */ continue; }\n";
         out << "                    for (int j = len; j > 0; j--) {\n";
         out << "                        if (!cur) break;\n";
         out << "                        values[j-1] = cur->value;\n";
+        if (L) out << "                        locs[j] = cur->loc;\n";
         out << "                        cur = cur->prev;\n";
         out << "                    }\n";
         out << "                    if (!cur && len > 0) continue;\n";
         out << "                    int prevstate = cur ? cur->state : 0;\n";
-        out << "                    YYSTYPE yyval = (len == 0)\n";
-        out << "                        ? (YYSTYPE){0}\n";
-        out << "                        : yyglr_run_action(rule, &values[len-1]"
-            << params_call(g_.parse_params) << ");\n";
+        if (L) {
+            out << "                    { YYLTYPE z; memset(&z, 0, sizeof(z));\n";
+            out << "                      locs[0] = cur ? cur->loc : z; }\n";
+            out << "                    YYLTYPE yyloc; YYLLOC_DEFAULT(yyloc, locs, len);\n";
+        }
+        out << "                    YYSTYPE *valptr = (len > 0) ? &values[len-1] : &values[0];\n";
+        if (L) out << "                    YYLTYPE *locptr = &locs[len];\n";
+        out << "                    YYSTYPE yyval = yyglr_run_action(rule, valptr";
+        if (L) out << ", locptr, &yyloc";
+        out << params_call(g_.parse_params) << ");\n";
         out << "                    /* GOTO */\n";
         out << "                    int yylhs = yyr1[rule];\n";
         out << "                    int nt = yylhs - YYNTOKENS;\n";
@@ -3798,7 +3850,9 @@ private:
         out << "                    else\n";
         out << "                        gostate = yydefgoto[nt];\n";
         out << "                    yyglr_grow(&next_tops, &next_cap, n_next + 1);\n";
-        out << "                    yyglr_node *n = yyglr_node_new(gostate, rule, yyval, cur);\n";
+        out << "                    yyglr_node *n = yyglr_node_new(gostate, rule, yyval, ";
+        if (L) out << "yyloc, ";
+        out << "cur);\n";
         out << "                    next_tops[n_next++] = n;\n";
         out << "                    progress = 1;\n";
         out << "                    /* Re-process this node against the same token. */\n";

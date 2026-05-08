@@ -24,20 +24,16 @@ Scale: at minimum +500 lines for the skeleton alone, more for the value-type
 machinery. Test infrastructure (`tests/runner/run_case.cmake.in`) needs a
 `driver.cc` codepath with `g++` instead of `cc`.
 
-### GLR: full Tomita GSS + locations + parse-params
+### GLR: full Tomita GSS
 
 A basic tree-of-stacks GLR runtime is in place: `%glr-parser` / `%dprec` /
-`%merge` are captured, conflict actions are kept in a side table, the
-emitter produces a parallel runtime that forks at conflicts, prunes errored
-branches, and merges convergent branches.  When two tops collapse, the
-resolver consults the user `%merge` function first and then `%dprec` (higher
-wins) before dropping arbitrarily.  `%parse-param` threads through `yyparse`
-and into action bodies.  Top arrays grow dynamically with no compile-time
-cap.  Limitations versus Bison's full GLR:
-
-- Locations aren't plumbed through the GLR driver.
-- Reduce-time RHS length is capped at the largest RHS across all rules,
-  computed at emit time — no further growth at runtime.
+`%merge` / `%locations` / `%parse-param` all flow through.  Conflict actions
+are kept in a side table, the emitter produces a parallel runtime that forks
+at conflicts, prunes errored branches, and merges convergent branches.  When
+two tops collapse, the resolver consults the user `%merge` function first
+and then `%dprec` (higher wins) before dropping arbitrarily.  Top arrays
+grow dynamically; only the per-reduce values[] / locs[] buffers are capped
+at compile time (largest RHS across all rules + 1).
 
 A full Tomita GSS implementation with shared prefixes and proper deferred-action
 semantics is the real target for grammars with deep ambiguity.
