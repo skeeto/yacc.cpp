@@ -174,6 +174,11 @@ struct Grammar {
     // indices and YYTRANSLATE is the identity, removing the need for the
     // external-to-internal yytranslate[] lookup.
     bool api_token_raw = false;
+    // %define lr.type: lalr (default) | ielr | canonical-lr
+    // Selects the parser-table construction algorithm.  canonical-lr
+    // produces strictly more states than LALR (full LR(1) item sets);
+    // LALR merges states with identical cores but different lookaheads.
+    string lr_type = "lalr";
     // %define parse.lac: none (default) | full
     // When full, the verbose error helper does an exploratory parse so the
     // expected-token list excludes tokens that would default-reduce and
@@ -831,6 +836,15 @@ private:
         }
         if (at(Tok::StrLit) || at(Tok::Identifier) || at(Tok::Int)) {
             string v = peek_.text;
+            advance();
+            // Stitch hyphenated values like "canonical-lr" or "push-pull"
+            // (the lexer split on the dash) back together.
+            while (at(Tok::Punct) && peek_.text == "-") {
+                v += "-";
+                advance();
+                if (at(Tok::Identifier)) { v += peek_.text; advance(); }
+                else break;
+            }
             if (name == "api.value.type") g_.api_value_type = v;
             else if (name == "api.prefix") g_.api_prefix = v;
             else if (name == "api.token.prefix") g_.token_prefix = v;
@@ -844,8 +858,8 @@ private:
             }
             else if (name == "api.push-pull") g_.api_push_pull = v;
             else if (name == "parse.lac") g_.parse_lac = v;
+            else if (name == "lr.type") g_.lr_type = v;
             else if (name == "api.location.type") g_.api_location_type = v;
-            advance();
         } else if (at(Tok::BraceBlock)) {
             // Braced value: keep raw braces for api.value.type but strip
             // them for prefix-like settings whose value is the body.
@@ -1153,8 +1167,12 @@ public:
         augment_and_number();
         compute_nullable();
         compute_first();
-        build_lr0();
-        compute_lookaheads();
+        if (g_.lr_type == "canonical-lr") {
+            build_canonical_lr1();
+        } else {
+            build_lr0();
+            compute_lookaheads();
+        }
         build_action_goto();
     }
 
@@ -1215,6 +1233,10 @@ private:
     vector<std::set<int>> sym_first_;
     vector<State> states_;
     int final_state_ = -1;
+    // Canonical LR(1) only: per-state expanded item lookaheads parallel
+    // to State::items.  Empty for LALR builds (which use compute_lookaheads
+    // and then expand via compute_ext_items at build_action_goto time).
+    vector<vector<std::set<int>>> items_la_;
 
     vector<int> term_internal_;
     vector<int> nonterm_internal_;
@@ -1425,6 +1447,130 @@ private:
                 if (it.prod == 0 && it.dot == aug_size) final_state_ = i;
     }
 
+    // Canonical LR(1): build the full LR(1) automaton.  States are
+    // identified by their LR(1) kernel (LR(0) items + per-item lookahead
+    // sets); states with the same LR(0) core but different lookaheads stay
+    // separate, unlike LALR which merges them.  Tables can be much larger.
+    void build_canonical_lr1() {
+        index_by_lhs();
+        // Each state's kernel is parallel (kernel[i], la[i]).
+        State s0;
+        s0.kernel = { Item{0u, 0u} };
+        s0.la = { std::set<int>{0} };  // {$end internal}
+        // Compute LR(1) closure: items[] holds expanded set, items_la[]
+        // holds parallel lookahead sets.  We reuse State::items but track
+        // per-item lookaheads via a local vector.
+        vector<std::set<int>> items_la_initial;
+        s0.items = lr1_closure(s0.kernel, s0.la, items_la_initial);
+        states_.push_back(std::move(s0));
+        state_access_.push_back(-1);
+        items_la_.push_back(items_la_initial);
+
+        // Identity key: sorted list of (item, lookahead-set) pairs.
+        auto make_key = [](const vector<Item>& k, const vector<std::set<int>>& la) {
+            vector<std::pair<Item, std::set<int>>> v;
+            v.reserve(k.size());
+            for (size_t i = 0; i < k.size(); i++) v.push_back({k[i], la[i]});
+            std::sort(v.begin(), v.end(),
+                [](const auto& a, const auto& b) {
+                    if (a.first.prod != b.first.prod) return a.first.prod < b.first.prod;
+                    if (a.first.dot  != b.first.dot)  return a.first.dot  < b.first.dot;
+                    return a.second < b.second;
+                });
+            return v;
+        };
+
+        std::map<vector<std::pair<Item, std::set<int>>>, int> by_kernel;
+        by_kernel[make_key(states_[0].kernel, states_[0].la)] = 0;
+
+        for (int s = 0; s < (int)states_.size(); s++) {
+            // For each transition symbol X, advance dots and merge lookaheads.
+            std::map<int, std::map<Item, std::set<int>>> next;
+            const auto& items = states_[s].items;
+            const auto& its_la = items_la_[s];
+            for (size_t k = 0; k < items.size(); k++) {
+                Item it = items[k];
+                const auto& rhs = g_.prods[it.prod].rhs;
+                if (it.dot >= rhs.size()) continue;
+                int X = rhs[it.dot];
+                Item advanced{it.prod, it.dot + 1};
+                auto& la_for = next[X][advanced];
+                for (int t : its_la[k]) la_for.insert(t);
+            }
+            for (auto& [X, kernel_map] : next) {
+                vector<Item> kernel;
+                vector<std::set<int>> kla;
+                for (auto& [it, la] : kernel_map) { kernel.push_back(it); kla.push_back(la); }
+                auto key = make_key(kernel, kla);
+                int target;
+                auto it = by_kernel.find(key);
+                if (it == by_kernel.end()) {
+                    target = (int)states_.size();
+                    State st;
+                    st.kernel = kernel;
+                    st.la = kla;
+                    vector<std::set<int>> new_items_la;
+                    st.items = lr1_closure(kernel, kla, new_items_la);
+                    states_.push_back(std::move(st));
+                    state_access_.push_back(X);
+                    items_la_.push_back(std::move(new_items_la));
+                    by_kernel[key] = target;
+                } else target = it->second;
+                states_[s].trans[X] = target;
+            }
+        }
+        // Detect final state.
+        size_t aug_size = g_.prods[0].rhs.size();
+        for (int i = 0; i < (int)states_.size(); i++)
+            for (auto& it : states_[i].kernel)
+                if (it.prod == 0 && it.dot == aug_size) final_state_ = i;
+    }
+
+    // LR(1) closure helper used by canonical-lr.  Given a kernel (vector
+    // of items with parallel lookahead sets), returns the full closure as
+    // items[] with parallel lookaheads in `out_la[]`.
+    vector<Item> lr1_closure(const vector<Item>& kernel,
+                             const vector<std::set<int>>& kernel_la,
+                             vector<std::set<int>>& out_la) {
+        std::map<Item, std::set<int>> closure;
+        for (size_t i = 0; i < kernel.size(); i++) {
+            for (int t : kernel_la[i]) closure[kernel[i]].insert(t);
+        }
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            auto snapshot = closure;
+            for (auto& [it, la_set] : snapshot) {
+                const auto& rhs = g_.prods[it.prod].rhs;
+                if (it.dot >= rhs.size()) continue;
+                int X = rhs[it.dot];
+                if (g_.syms[X].is_terminal) continue;
+                // Compute FIRST(beta · a) for each lookahead a.
+                for (int p : by_lhs_[X]) {
+                    Item ni{(uint32_t)p, 0};
+                    for (int a : la_set) {
+                        std::set<int> firstset;
+                        bool nullable_seq = true;
+                        first_of_seq(rhs, it.dot + 1, firstset, nullable_seq);
+                        if (nullable_seq) firstset.insert(a);
+                        size_t before = closure[ni].size();
+                        for (int t : firstset) closure[ni].insert(t);
+                        if (closure[ni].size() != before) changed = true;
+                    }
+                }
+            }
+        }
+        vector<Item> items;
+        out_la.clear();
+        items.reserve(closure.size());
+        out_la.reserve(closure.size());
+        for (auto& [it, la_set] : closure) {
+            items.push_back(it);
+            out_la.push_back(la_set);
+        }
+        return items;
+    }
+
     void compute_lookaheads() {
         // Initial: state 0 kernel item ($accept -> . S $end) gets {$end}.
         states_[0].la[0].insert(0);
@@ -1500,6 +1646,18 @@ private:
     // Returns list of {prod, dot, lookahead-set} per state.
     struct ExtItem { Item core; std::set<int> la; };
     vector<vector<ExtItem>> compute_ext_items() {
+        // Canonical LR(1) build already has the full per-item lookaheads
+        // attached to State::items via items_la_.  Just emit those directly.
+        if (g_.lr_type == "canonical-lr" && !items_la_.empty()) {
+            vector<vector<ExtItem>> R(states_.size());
+            for (int s = 0; s < (int)states_.size(); s++) {
+                R[s].reserve(states_[s].items.size());
+                for (size_t k = 0; k < states_[s].items.size(); k++) {
+                    R[s].push_back({states_[s].items[k], items_la_[s][k]});
+                }
+            }
+            return R;
+        }
         vector<vector<ExtItem>> R(states_.size());
         for (int s = 0; s < (int)states_.size(); s++) {
             // For each kernel item with its lookahead set, do LR(1) closure.
