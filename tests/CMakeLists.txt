@@ -4,10 +4,19 @@
 #   input.txt           - stdin to feed
 #   expected.txt        - expected stdout
 #   options.txt         - (optional) extra command-line flags for generator
-# Each case is run twice: once with bison, once with the local yacc.cpp binary.
+# When bison is on PATH, each case is registered twice (once for bison,
+# once for the local yacc.cpp binary) so we differential-test.  When
+# bison is missing, the build still works -- only the yacc_* tests run.
 
-set(BISON_BIN bison CACHE FILEPATH "Path to bison")
-find_program(BISON_BIN_EXISTS NAMES ${BISON_BIN} REQUIRED)
+set(BISON_BIN bison CACHE FILEPATH "Path to bison (optional)")
+find_program(BISON_BIN_EXISTS NAMES ${BISON_BIN})
+if(BISON_BIN_EXISTS)
+    set(GENERATORS bison yacc)
+    message(STATUS "yacc.cpp tests: differential against bison at ${BISON_BIN_EXISTS}")
+else()
+    set(GENERATORS yacc)
+    message(STATUS "yacc.cpp tests: bison not found, running yacc-only tests")
+endif()
 
 # Cross-platform "diff": compare normalized output via a small helper script.
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/runner/run_case.cmake.in
@@ -21,10 +30,9 @@ foreach(CASE_NAME ${TEST_DIRS})
     set(CASE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cases/${CASE_NAME})
     if(IS_DIRECTORY ${CASE_DIR})
         if(EXISTS ${CASE_DIR}/grammar.y)
-            # Each case yields two tests: bison and yacc.
-            foreach(GEN bison yacc)
+            foreach(GEN ${GENERATORS})
                 if(${GEN} STREQUAL "bison")
-                    set(GEN_BIN ${BISON_BIN})
+                    set(GEN_BIN ${BISON_BIN_EXISTS})
                 else()
                     set(GEN_BIN $<TARGET_FILE:yacc>)
                 endif()
