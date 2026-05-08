@@ -76,8 +76,3 @@ install(TARGETS yacc
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS y
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
-# Project documentation.
-install(FILES
-        ${CMAKE_SOURCE_DIR}/TODO.md
-        ${CMAKE_SOURCE_DIR}/docs/yacc-howto.md
-    DESTINATION ${CMAKE_INSTALL_DOCDIR})
