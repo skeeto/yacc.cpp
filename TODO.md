@@ -1,8 +1,7 @@
 # TODO
 
-Bison features that are recognized (parsed without error) but not fully
-implemented, or not implemented at all. Roughly grouped by impact and effort.
-Each item lists the relevant file/line ranges to start from.
+Bison features that are recognized (parsed without error) but only partially
+implemented, or not implemented at all. Roughly grouped by effort.
 
 ## Large items (each comparable in size to the existing implementation)
 
@@ -38,7 +37,7 @@ A real GLR runtime needs:
   `src/yacc.cpp:122`).
 - Resolution at merge points: highest `%dprec` wins; user-supplied merge
   function combines semantic values.
-- New emit_glr_driver method; ~600 lines of new runtime.
+- New `emit_glr_driver` method; ~600 lines of new runtime.
 
 ### IELR(1) (`%define lr.type ielr`)
 
@@ -71,16 +70,15 @@ by descending density. Tables get markedly smaller for non-trivial grammars.
 A first attempt was reverted because the verbose-error walker
 (`yysyntax_error`) had false positives when first-fit packing let a state's
 lookup land in another state's cell whose `yycheck` happened to match. A
-correct implementation either tightens the walker (also confirm the entry
-belongs to `yystate` via `yypact`) or relies on Bison's split shift/reduce
-trick where shifts and reduces don't overlap.
+correct implementation uses Bison's split shift/reduce trick where shifts
+and reduces don't overlap; then the verbose walker only consults `yysindex`.
 
 ## Small items
 
 ### `%define api.value.automove` (C++ only)
 
 Wrap each `$N` in actions with `std::move(...)`. Depends on the C++ skeleton.
-Touches `translate_action` (`src/yacc.cpp:1900`).
+Touches `translate_action`.
 
 ### `%define api.value.type variant` (C++ only)
 
@@ -105,9 +103,3 @@ interface is properly factored.
 Tests currently differential against whichever `bison` is on `PATH`. Adding a
 matrix over (3.0, 3.5, 3.8.x) would catch behaviour that drifted between
 versions.
-
-### Larger fuzz corpus and longer fuzz time in CI
-
-`fuzz_short` runs 20k iterations; consider a nightly job at 10M+ iterations.
-The corpus seed is the named test grammars; auto-generated coverage entries
-are gitignored.

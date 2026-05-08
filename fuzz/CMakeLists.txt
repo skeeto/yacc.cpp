@@ -28,7 +28,7 @@ set_tests_properties(fuzz_corpus_replay PROPERTIES
     LABELS fuzz
     TIMEOUT 60)
 
-# Short fuzz run for CI to catch regressions.
+# Short fuzz run for CI to catch regressions (~10s).
 add_test(
     NAME fuzz_short
     COMMAND $<TARGET_FILE:yacc_fuzz>
@@ -38,3 +38,15 @@ add_test(
 set_tests_properties(fuzz_short PROPERTIES
     LABELS fuzz
     TIMEOUT 120)
+
+# Long fuzz run, opt-in via `ctest -L fuzz_long`.  Useful for nightly
+# CI: ~10 minutes, exercises mutated grammar inputs aggressively.
+add_test(
+    NAME fuzz_long
+    COMMAND $<TARGET_FILE:yacc_fuzz>
+        -max_len=1024 -timeout=10 -runs=5000000 -rss_limit_mb=2048
+        ${CMAKE_SOURCE_DIR}/fuzz/corpus
+)
+set_tests_properties(fuzz_long PROPERTIES
+    LABELS fuzz_long
+    TIMEOUT 1200)
