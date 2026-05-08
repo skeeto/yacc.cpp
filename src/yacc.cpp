@@ -159,6 +159,8 @@ struct Grammar {
     string api_value_type;
     string api_value_union_name;
     bool want_locations = false;
+    // %define parse.error: simple (default) | verbose | detailed | custom
+    string parse_error_mode = "simple";
     string api_prefix;
     string token_prefix;
     int expected_sr = -1;
@@ -685,6 +687,7 @@ private:
             if (name == "api.value.type") g_.api_value_type = v;
             else if (name == "api.prefix") g_.api_prefix = v;
             else if (name == "api.token.prefix") g_.token_prefix = v;
+            else if (name == "parse.error") g_.parse_error_mode = v;
             advance();
         } else if (at(Tok::BraceBlock)) {
             string v = "{" + peek_.text + "}";
@@ -1754,7 +1757,24 @@ private:
         out << "static const char * const yytname[] = {\n";
         for (int i = 0; i < l_.n_total_syms(); i++) {
             int s = l_.internal_to_sym(i);
-            string nm = (s == g_.eof_sym) ? "$end" : g_.syms[s].name;
+            string nm;
+            if (s == g_.eof_sym) nm = "end of file";
+            else if (s == g_.error_sym) nm = "error";
+            else if (s == g_.undef_sym) nm = "invalid token";
+            else {
+                // Prefer a string-literal alias ("if" instead of IF) for
+                // diagnostic output, matching Bison's yytname convention.
+                // The alias is stored with surrounding quotes; strip them
+                // so error messages read 'expecting if' not 'expecting "if"'.
+                nm = g_.syms[s].name;
+                for (const auto& sym : g_.syms) {
+                    if (sym.alias_of == s && sym.name.size() >= 2 &&
+                        sym.name.front() == '"' && sym.name.back() == '"') {
+                        nm = sym.name.substr(1, sym.name.size() - 2);
+                        break;
+                    }
+                }
+            }
             out << "  \"" << esc(nm) << "\",\n";
         }
         out << "  0\n};\n";
@@ -1768,6 +1788,47 @@ private:
             "#endif\n"
             "void yyerror(const char *msg) { (void)fprintf(stderr, \"%s\\n\", msg); }\n"
             "#endif\n";
+        // Verbose / detailed error: build a message naming the unexpected
+        // token and the set of tokens that would be acceptable in this state,
+        // walking yypact[]/yytable[]/yycheck[].
+        if (g_.parse_error_mode == "verbose" || g_.parse_error_mode == "detailed") {
+            out << "static void yysyntax_error(int yystate, int yytoken) {\n";
+            out << "    char buf[512];\n";
+            out << "    size_t off = 0;\n";
+            out << "    int n = snprintf(buf + off, sizeof(buf) - off, \"syntax error\");\n";
+            out << "    if (n > 0) off += (size_t)n;\n";
+            out << "    if (yytoken >= 0 && yytoken < YYNTOKENS) {\n";
+            out << "        n = snprintf(buf + off, sizeof(buf) - off, \", unexpected %s\", yytname[yytoken]);\n";
+            out << "        if (n > 0) off += (size_t)n;\n";
+            out << "    }\n";
+            // Up to 4 expected tokens.
+            out << "    int yyx;\n";
+            out << "    int yyn = yypact[yystate];\n";
+            out << "    int count = 0;\n";
+            out << "    int expected[4];\n";
+            out << "    if (!yypact_value_is_default(yyn)) {\n";
+            out << "        for (yyx = 0; yyx < YYNTOKENS && count < 4; ++yyx) {\n";
+            out << "            int yychk = yyn + yyx;\n";
+            out << "            if (yychk >= 0 && yychk < (int)YYTABLE_SIZE\n";
+            out << "                && yycheck[yychk] == yyx\n";
+            out << "                && !yytable_value_is_error(yytable[yychk])\n";
+            out << "                && yyx != " << l_.error_internal() << "\n";
+            out << "                && yyx != " << l_.undef_internal() << ") {\n";
+            out << "                expected[count++] = yyx;\n";
+            out << "            }\n";
+            out << "        }\n";
+            out << "    }\n";
+            out << "    for (int i = 0; i < count; ++i) {\n";
+            out << "        const char *prefix = (i == 0) ? \", expecting \" :\n";
+            out << "                             (i + 1 == count) ? \" or \" : \", \";\n";
+            out << "        n = snprintf(buf + off, sizeof(buf) - off, \"%s%s\", prefix, yytname[expected[i]]);\n";
+            out << "        if (n > 0) off += (size_t)n;\n";
+            out << "        if (off >= sizeof(buf)) { off = sizeof(buf) - 1; break; }\n";
+            out << "    }\n";
+            out << "    buf[off < sizeof(buf) ? off : sizeof(buf) - 1] = 0;\n";
+            out << "    yyerror(buf);\n";
+            out << "}\n";
+        }
     }
 
     void emit_driver(Buf out) {
@@ -2068,7 +2129,13 @@ private:
         out << "    goto yynewstate;\n";
         out << "\n";
         out << "yyerrlab:\n";
-        out << "    if (!yyerrstatus) { ++yynerrs; yyerror(\"syntax error\"); }\n";
+        const bool verbose = (g_.parse_error_mode == "verbose" ||
+                              g_.parse_error_mode == "detailed");
+        if (verbose) {
+            out << "    if (!yyerrstatus) { ++yynerrs; yysyntax_error(yystate, yytoken); }\n";
+        } else {
+            out << "    if (!yyerrstatus) { ++yynerrs; yyerror(\"syntax error\"); }\n";
+        }
         out << "yyerrorlab:\n";
         out << "    if (yyerrstatus == 3) {\n";
         out << "        if (yychar <= 0) goto yyabortlab;\n";
