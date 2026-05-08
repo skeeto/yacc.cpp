@@ -3693,7 +3693,9 @@ private:
 
         // Action switch.  Same shape as the deterministic switch but
         // uses a local yyvsp for resolved actions during reduce.
-        out << "static YYSTYPE yyglr_run_action(int rule, YYSTYPE *vals_top) {\n";
+        out << "static YYSTYPE yyglr_run_action(int rule, YYSTYPE *vals_top";
+        for (auto& p : g_.parse_params) out << ", " << p;
+        out << ") {\n";
         out << "    YYSTYPE yyval;\n";
         out << "    YYSTYPE *yyvsp = vals_top;\n";
         out << "    int yylen;\n";
@@ -3715,14 +3717,28 @@ private:
         out << "    YYSTYPE z; memset(&z, 0, sizeof(z)); return z;\n";
         out << "}\n";
 
-        // The driver itself.
+        // The driver itself.  Tops grow dynamically via realloc — no
+        // hard cap on simultaneous parse paths.  YYGLR_MAX_RHS bounds the
+        // values[] buffer used during a single reduce; computed below as
+        // the largest RHS length across all rules.
+        int max_rhs_len = 1;
+        for (int p = 0; p < l_.n_rules(); p++)
+            max_rhs_len = std::max(max_rhs_len, (int)l_.prod(p).rhs.size());
+        out << "#define YYGLR_MAX_RHS " << (max_rhs_len + 1) << "\n";
         out << "extern int yylex(void);\n";
-        out << "int yyparse(void) {\n";
-        out << "    /* Active stack tops; each is a yyglr_node*. */\n";
-        out << "    yyglr_node *tops_a[16];\n";
-        out << "    yyglr_node *tops_b[16];\n";
-        out << "    yyglr_node **tops = tops_a;\n";
-        out << "    yyglr_node **next_tops = tops_b;\n";
+        out << "static void yyglr_grow(yyglr_node ***arr, int *cap, int need) {\n";
+        out << "    if (*cap >= need) return;\n";
+        out << "    int nc = *cap ? *cap : 16;\n";
+        out << "    while (nc < need) nc *= 2;\n";
+        out << "    *arr = (yyglr_node**)realloc(*arr, nc * sizeof(**arr));\n";
+        out << "    *cap = nc;\n";
+        out << "}\n";
+        out << "int yyparse(" << params_decl_signature() << ") {\n";
+        out << "    /* Active stack tops; each is a yyglr_node*.  Heap-allocated\n";
+        out << "       and grown on demand. */\n";
+        out << "    int tops_cap = 16, next_cap = 16;\n";
+        out << "    yyglr_node **tops = (yyglr_node**)malloc(tops_cap * sizeof(*tops));\n";
+        out << "    yyglr_node **next_tops = (yyglr_node**)malloc(next_cap * sizeof(*next_tops));\n";
         out << "    YYSTYPE init_val; memset(&init_val, 0, sizeof(init_val));\n";
         out << "    tops[0] = yyglr_node_new(0, 0, init_val, NULL);\n";
         out << "    int n_tops = 1;\n";
@@ -3749,7 +3765,7 @@ private:
         out << "                if (act == 0) { any_accept = 1; continue; }\n";
         out << "                if (act > 0) {\n";
         out << "                    /* Shift to state act. */\n";
-        out << "                    if (n_next >= 16) continue;\n";
+        out << "                    yyglr_grow(&next_tops, &next_cap, n_next + 1);\n";
         out << "                    yyglr_node *n = yyglr_node_new(act, 0, yylval, top);\n";
         out << "                    next_tops[n_next++] = n;\n";
         out << "                    progress = 1;\n";
@@ -3759,8 +3775,8 @@ private:
         out << "                    int rule = -act;\n";
         out << "                    int len = yyr2[rule];\n";
         out << "                    yyglr_node *cur = top;\n";
-        out << "                    YYSTYPE values[16];\n";
-        out << "                    if (len > 16) { /* too deep */ continue; }\n";
+        out << "                    YYSTYPE values[YYGLR_MAX_RHS];\n";
+        out << "                    if (len >= YYGLR_MAX_RHS) { /* too deep */ continue; }\n";
         out << "                    for (int j = len; j > 0; j--) {\n";
         out << "                        if (!cur) break;\n";
         out << "                        values[j-1] = cur->value;\n";
@@ -3770,7 +3786,8 @@ private:
         out << "                    int prevstate = cur ? cur->state : 0;\n";
         out << "                    YYSTYPE yyval = (len == 0)\n";
         out << "                        ? (YYSTYPE){0}\n";
-        out << "                        : yyglr_run_action(rule, &values[len-1]);\n";
+        out << "                        : yyglr_run_action(rule, &values[len-1]"
+            << params_call(g_.parse_params) << ");\n";
         out << "                    /* GOTO */\n";
         out << "                    int yylhs = yyr1[rule];\n";
         out << "                    int nt = yylhs - YYNTOKENS;\n";
@@ -3780,7 +3797,7 @@ private:
         out << "                        gostate = yytable[gpos];\n";
         out << "                    else\n";
         out << "                        gostate = yydefgoto[nt];\n";
-        out << "                    if (n_next >= 16) continue;\n";
+        out << "                    yyglr_grow(&next_tops, &next_cap, n_next + 1);\n";
         out << "                    yyglr_node *n = yyglr_node_new(gostate, rule, yyval, cur);\n";
         out << "                    next_tops[n_next++] = n;\n";
         out << "                    progress = 1;\n";
@@ -3833,6 +3850,7 @@ private:
         out << "        n_next = compact;\n";
         // Swap.
         out << "        yyglr_node **tmp = tops; tops = next_tops; next_tops = tmp;\n";
+        out << "        int tcap_tmp = tops_cap; tops_cap = next_cap; next_cap = tcap_tmp;\n";
         out << "        n_tops = n_next;\n";
         out << "        if (any_accept) { result = 0; break; }\n";
         out << "        if (n_tops == 0) {\n";
@@ -3859,6 +3877,8 @@ private:
         out << "    }\n";
         out << "yyglr_done:\n";
         out << "    for (int i = 0; i < n_tops; i++) yyglr_node_release(tops[i]);\n";
+        out << "    free(tops);\n";
+        out << "    free(next_tops);\n";
         out << "    return result;\n";
         out << "}\n";
     }

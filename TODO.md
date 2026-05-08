@@ -31,11 +31,13 @@ A basic tree-of-stacks GLR runtime is in place: `%glr-parser` / `%dprec` /
 emitter produces a parallel runtime that forks at conflicts, prunes errored
 branches, and merges convergent branches.  When two tops collapse, the
 resolver consults the user `%merge` function first and then `%dprec` (higher
-wins) before dropping arbitrarily.  Limitations versus Bison's full GLR:
+wins) before dropping arbitrarily.  `%parse-param` threads through `yyparse`
+and into action bodies.  Top arrays grow dynamically with no compile-time
+cap.  Limitations versus Bison's full GLR:
 
-- Locations and `%parse-param` aren't plumbed through the GLR driver.
-- Top count and node-pop depth are bounded at compile-time (16); deeply
-  ambiguous parses won't fit.
+- Locations aren't plumbed through the GLR driver.
+- Reduce-time RHS length is capped at the largest RHS across all rules,
+  computed at emit time — no further growth at runtime.
 
 A full Tomita GSS implementation with shared prefixes and proper deferred-action
 semantics is the real target for grammars with deep ambiguity.
