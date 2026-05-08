@@ -1831,6 +1831,20 @@ private:
         for (int i = 0; names[i]; i++) {
             out << "#define yy" << names[i] << " " << p << names[i] << "\n";
         }
+        // Also rename the YY*-prefixed types so two parsers in one
+        // translation unit don't collide on YYSTYPE / YYLTYPE / YYDEBUG.
+        // Bison uses the uppercased user prefix here.  Numeric constants
+        // like YYNTOKENS are file-local #defines that don't escape to the
+        // linker, so we leave those alone (renaming them would re-define
+        // the macros twice and collide with the constant emission below).
+        string up = p;
+        for (char& c : up) if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+        static const char* upper_names[] = {
+            "STYPE", "LTYPE", "DEBUG", "TOKENTYPE", nullptr
+        };
+        for (int i = 0; upper_names[i]; i++) {
+            out << "#define YY" << upper_names[i] << " " << up << upper_names[i] << "\n";
+        }
     }
 
     static string esc(const string& s) {
@@ -1896,7 +1910,12 @@ private:
     }
 
     void emit_value_type(Buf out) {
-        out << "#if !defined YYSTYPE && !defined YYSTYPE_IS_DECLARED\n";
+        // Guard only on YYSTYPE_IS_DECLARED — checking !defined YYSTYPE
+        // is broken when api.prefix is in effect, because the macro
+        // `#define YYSTYPE <UP>STYPE` makes `defined YYSTYPE` true and
+        // skips the typedef.  YYSTYPE_IS_DECLARED is unique per-include
+        // and not subject to the rename.
+        out << "#ifndef YYSTYPE_IS_DECLARED\n";
         if (g_.has_union) {
             if (!opts_.no_lines)
                 out << "#line 1 \"" << g_.source_file << "\"\n";
@@ -1917,7 +1936,7 @@ private:
         out << "# define YYSTYPE_IS_DECLARED 1\n";
         out << "#endif\n";
         if (g_.want_locations) {
-            out << "#if !defined YYLTYPE && !defined YYLTYPE_IS_DECLARED\n";
+            out << "#ifndef YYLTYPE_IS_DECLARED\n";
             out << "typedef struct YYLTYPE {\n";
             out << "  int first_line; int first_column;\n";
             out << "  int last_line;  int last_column;\n";

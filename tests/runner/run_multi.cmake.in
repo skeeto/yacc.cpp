@@ -1,0 +1,65 @@
+# Multi-parser test runner.  Variables (passed via -D):
+#   CASE_DIR     - test case directory containing grammar_a.y, grammar_b.y,
+#                  driver.c, driver_b.c, expected.txt, optional input.txt
+#   WORK_DIR     - scratch build dir
+#   GEN          - "bison" or "yacc"
+#   GEN_BIN      - generator executable
+#   C_COMPILER   - C compiler
+
+file(MAKE_DIRECTORY ${WORK_DIR})
+
+foreach(SUFFIX a b)
+    file(COPY ${CASE_DIR}/grammar_${SUFFIX}.y DESTINATION ${WORK_DIR})
+    set(OUT_C ${WORK_DIR}/grammar_${SUFFIX}.tab.c)
+    execute_process(
+        COMMAND ${GEN_BIN} -d -o ${OUT_C} ${WORK_DIR}/grammar_${SUFFIX}.y
+        WORKING_DIRECTORY ${WORK_DIR}
+        RESULT_VARIABLE GEN_RC
+        ERROR_VARIABLE  GEN_ERR
+    )
+    if(NOT GEN_RC EQUAL 0)
+        message(FATAL_ERROR "${GEN} on grammar_${SUFFIX}.y failed: ${GEN_ERR}")
+    endif()
+endforeach()
+
+file(COPY ${CASE_DIR}/driver.c   DESTINATION ${WORK_DIR})
+file(COPY ${CASE_DIR}/driver_b.c DESTINATION ${WORK_DIR})
+
+set(EXE ${WORK_DIR}/test_prog)
+execute_process(
+    COMMAND ${C_COMPILER} -std=c11 -O0 -g -Wno-unused -Wno-implicit-function-declaration
+            -Wno-error=implicit-function-declaration -Wno-int-conversion
+            -Wno-incompatible-pointer-types -Wno-deprecated-non-prototype
+            -I${WORK_DIR}
+            ${WORK_DIR}/grammar_a.tab.c
+            ${WORK_DIR}/grammar_b.tab.c
+            ${WORK_DIR}/driver.c
+            ${WORK_DIR}/driver_b.c
+            -o ${EXE}
+    RESULT_VARIABLE CC_RC
+    OUTPUT_VARIABLE CC_OUT
+    ERROR_VARIABLE  CC_ERR
+)
+if(NOT CC_RC EQUAL 0)
+    message(FATAL_ERROR "compile failed (rc=${CC_RC}):\nstdout: ${CC_OUT}\nstderr: ${CC_ERR}")
+endif()
+
+set(EXPECTED ${CASE_DIR}/expected.txt)
+file(READ ${EXPECTED} EXPECTED_CONTENT)
+
+execute_process(
+    COMMAND ${EXE}
+    OUTPUT_VARIABLE ACTUAL
+    ERROR_VARIABLE  ACTUAL_ERR
+    RESULT_VARIABLE RUN_RC
+    TIMEOUT 30
+)
+
+string(REPLACE "\r\n" "\n" ACTUAL "${ACTUAL}")
+string(REPLACE "\r\n" "\n" EXPECTED_CONTENT "${EXPECTED_CONTENT}")
+string(REGEX REPLACE "[\n ]+$" "" ACTUAL "${ACTUAL}")
+string(REGEX REPLACE "[\n ]+$" "" EXPECTED_CONTENT "${EXPECTED_CONTENT}")
+
+if(NOT "${ACTUAL}" STREQUAL "${EXPECTED_CONTENT}")
+    message(FATAL_ERROR "Output mismatch (rc=${RUN_RC}):\n--- expected ---\n${EXPECTED_CONTENT}\n--- actual ---\n${ACTUAL}\n--- stderr ---\n${ACTUAL_ERR}\n")
+endif()
