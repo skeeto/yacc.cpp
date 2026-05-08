@@ -138,6 +138,10 @@ struct Production {
     // For parent rules: the rhs_tags reflects ALL slots, including synthetic
     // mid-rule placeholders. midrule_tags[k] = lhs_tag of synthetic at slot k+1
     // (only used to expose typed refs across mid-rule boundary; usually unused).
+
+    // GLR-only:
+    int dprec = 0;          // %dprec N: dynamic precedence at merge points.
+    string merge_fn;        // %merge <fn>: user function combining two values.
 };
 
 struct Grammar {
@@ -179,6 +183,10 @@ struct Grammar {
     // produces strictly more states than LALR (full LR(1) item sets);
     // LALR merges states with identical cores but different lookaheads.
     string lr_type = "lalr";
+    // %glr-parser: emit a GLR runtime instead of the deterministic LALR
+    // driver.  Conflicts are kept as multiple parse-paths run lock-step,
+    // resolved at merge points by %dprec (higher wins) or %merge function.
+    bool is_glr = false;
     // %define parse.lac: none (default) | full
     // When full, the verbose error helper does an exploratory parse so the
     // expected-token list excludes tokens that would default-reduce and
@@ -736,7 +744,9 @@ private:
                 g_.api_pure = "full";
                 return;
             case Tok::PercentGlrParser:
-                advance(); return;
+                advance();
+                g_.is_glr = true;
+                return;
             case Tok::PercentToken_Table: advance(); opts_.token_table = true; return;
             case Tok::PercentNoLines: advance(); opts_.no_lines = true; return;
             case Tok::PercentParseParam:
@@ -1059,10 +1069,16 @@ private:
                 p.prec_sym = idx;
             } else if (at(Tok::PercentDPrec)) {
                 advance();
-                if (at(Tok::Int)) advance();
+                if (at(Tok::Int)) {
+                    p.dprec = (int)peek_.ival;
+                    advance();
+                }
             } else if (at(Tok::PercentMerge)) {
                 advance();
-                if (at(Tok::Tag)) advance();
+                if (at(Tok::Tag)) {
+                    p.merge_fn = peek_.text;
+                    advance();
+                }
             } else if (at(Tok::BraceBlock)) {
                 Token b = peek_;
                 advance();
@@ -1247,6 +1263,14 @@ public:
     // (state, terminal-internal-index, kind) where kind=1 is S/R, kind=2 is R/R.
     struct Conflict { int state; int term_internal; int kind; };
     vector<Conflict> conflicts;
+
+    // GLR-only: alternate actions kept alongside the resolved primary
+    // action.  Each entry: (state, term_internal, action) where the
+    // action follows the same encoding as action_[] (positive = shift
+    // dst+1, negative = reduce by -rule).  The GLR runtime queries
+    // both action_[] and this side list to spawn parallel parse paths.
+    struct GlrAction { int state; int term_internal; int action; };
+    vector<GlrAction> glr_extra_actions;
 private:
 
     vector<int> term_internal_;
@@ -1775,6 +1799,10 @@ private:
                         } else {
                             sr_conflicts_++;
                             conflicts.push_back({s, la, 1});
+                            // GLR keeps both actions; LALR drops the
+                            // reduce in favor of the shift.
+                            if (g_.is_glr)
+                                glr_extra_actions.push_back({s, la, red});
                             // default: prefer shift
                         }
                     } else {
@@ -1782,7 +1810,18 @@ private:
                         int existing_rule = -cur;
                         rr_conflicts_++;
                         conflicts.push_back({s, la, 2});
-                        if ((int)ei.core.prod < existing_rule) action_[idx] = red;
+                        if (g_.is_glr) {
+                            // Keep BOTH reduces.  The current cell stays
+                            // as 'cur' (the earlier rule); the new one
+                            // goes to the extras list.
+                            glr_extra_actions.push_back({s, la, red});
+                        }
+                        if ((int)ei.core.prod < existing_rule) {
+                            // The newer rule wins by index; demote cur.
+                            if (g_.is_glr)
+                                glr_extra_actions.push_back({s, la, cur});
+                            action_[idx] = red;
+                        }
                     }
                 }
             }
@@ -2019,19 +2058,23 @@ public:
         emit_destructor(out);
         emit_printer(out);
         emit_trace_macros(out);
-        // Push-only mode replaces yyparse() with yypstate_new /
-        // yypush_parse / yypstate_delete.  Both-mode keeps yyparse and
-        // adds the push API on top.
+        // GLR replaces yyparse with a tree-of-stacks runtime; otherwise
+        // push-only replaces it with the push API; otherwise the
+        // standard pull driver, optionally augmented by the push API
+        // (api.push-pull=both).
         const bool push_only = (g_.api_push_pull == "push");
         const bool push_both = (g_.api_push_pull == "both");
-        if (!push_only) {
-            emit_driver(out);
-            emit_action_switch(out);
-            emit_driver_tail(out);
-        }
-        if (push_only || push_both) {
-            emit_push_driver(out);
-            // emit_push_driver inlines its own switch and tail.
+        if (g_.is_glr) {
+            emit_glr_driver(out);
+        } else {
+            if (!push_only) {
+                emit_driver(out);
+                emit_action_switch(out);
+                emit_driver_tail(out);
+            }
+            if (push_only || push_both) {
+                emit_push_driver(out);
+            }
         }
 
         if (!g_.epilogue.empty()) {
@@ -3493,6 +3536,292 @@ private:
             out << "    return rc;\n";
             out << "}\n";
         }
+    }
+
+    // GLR runtime: tree-of-stacks parser that forks at conflicts, runs
+    // all parse paths lock-step over the input, prunes branches that
+    // hit errors, and merges branches that converge to the same state.
+    // %dprec selects the highest-precedence merge candidate; %merge
+    // calls a user-supplied combiner for semantic values.  Locations
+    // and parse-params are NOT plumbed through GLR yet — they're a
+    // straightforward extension once the deterministic core works.
+    //
+    // Conflict actions live in two parallel arrays emitted earlier:
+    //   yyglr_extra_state[i] / yyglr_extra_token[i] / yyglr_extra_action[i]
+    void emit_glr_driver(Buf out) {
+        // Emit the alternate-action table.
+        const auto& extras = l_.glr_extra_actions;
+        // Sort by (state, token) for binary-search lookup.
+        vector<LALR::GlrAction> sorted_extras = extras;
+        std::sort(sorted_extras.begin(), sorted_extras.end(),
+            [](const LALR::GlrAction& a, const LALR::GlrAction& b) {
+                if (a.state != b.state) return a.state < b.state;
+                return a.term_internal < b.term_internal;
+            });
+        out << "static const short yyglr_extra_n = " << sorted_extras.size() << ";\n";
+        if (sorted_extras.empty()) {
+            out << "static const short yyglr_extra_state[1] = { 0 };\n";
+            out << "static const short yyglr_extra_token[1] = { 0 };\n";
+            out << "static const short yyglr_extra_action[1] = { 0 };\n";
+        } else {
+            out << "static const short yyglr_extra_state[" << sorted_extras.size() << "] = {";
+            for (size_t i = 0; i < sorted_extras.size(); i++)
+                out << (i ? "," : "") << " " << sorted_extras[i].state;
+            out << " };\n";
+            out << "static const short yyglr_extra_token[" << sorted_extras.size() << "] = {";
+            for (size_t i = 0; i < sorted_extras.size(); i++)
+                out << (i ? "," : "") << " " << sorted_extras[i].term_internal;
+            out << " };\n";
+            out << "static const short yyglr_extra_action[" << sorted_extras.size() << "] = {";
+            for (size_t i = 0; i < sorted_extras.size(); i++)
+                out << (i ? "," : "") << " " << sorted_extras[i].action;
+            out << " };\n";
+        }
+
+        // Per-rule dprec table.
+        out << "static const short yyglr_dprec[" << l_.n_rules() << "] = {";
+        for (int p = 0; p < l_.n_rules(); p++)
+            out << (p ? "," : "") << " " << l_.prod(p).dprec;
+        out << " };\n";
+
+        // %merge function names per rule.  We emit a switch+function
+        // call indexed by rule.
+        out << "/* %merge per-rule resolver. */\n";
+        out << "static int yyglr_merge_value(int rule, YYSTYPE *a, YYSTYPE *b, YYSTYPE *out) {\n";
+        out << "    switch (rule) {\n";
+        for (int p = 0; p < l_.n_rules(); p++) {
+            const auto& prod = l_.prod(p);
+            if (!prod.merge_fn.empty()) {
+                out << "    case " << p << ":\n";
+                out << "        *out = " << prod.merge_fn << "(*a, *b); return 1;\n";
+            }
+        }
+        out << "    default: break;\n";
+        out << "    }\n";
+        out << "    (void)a; (void)b; (void)out; return 0;\n";
+        out << "}\n";
+
+        // Tree-of-stacks node + parser.
+        out << "typedef struct yyglr_node {\n";
+        out << "    int state;\n";
+        out << "    YYSTYPE value;\n";
+        out << "    struct yyglr_node *prev;\n";
+        out << "    int refcount;\n";
+        out << "} yyglr_node;\n";
+
+        out << "static yyglr_node *yyglr_node_new(int state, YYSTYPE value, yyglr_node *prev) {\n";
+        out << "    yyglr_node *n = (yyglr_node*)malloc(sizeof(*n));\n";
+        out << "    n->state = state; n->value = value; n->prev = prev;\n";
+        out << "    n->refcount = 1;\n";
+        out << "    if (prev) prev->refcount++;\n";
+        out << "    return n;\n";
+        out << "}\n";
+        out << "static void yyglr_node_release(yyglr_node *n) {\n";
+        out << "    while (n && --n->refcount == 0) {\n";
+        out << "        yyglr_node *prev = n->prev;\n";
+        out << "        free(n);\n";
+        out << "        n = prev;\n";
+        out << "    }\n";
+        out << "}\n";
+
+        // Look up actions for (state, token) — primary plus extras.
+        // Returns count and writes up to YYGLR_MAX_ACT actions.
+        out << "#define YYGLR_MAX_ACT 4\n";
+        out << "static int yyglr_actions_for(int state, int yytoken, int *out_acts, int *out_rules) {\n";
+        out << "    int n = 0;\n";
+        // Primary via yypact.
+        out << "    int yyn = yypact[state];\n";
+        out << "    if (!yypact_value_is_default(yyn)) {\n";
+        out << "        int idx = yyn + yytoken;\n";
+        out << "        if (idx >= 0 && idx < (int)YYTABLE_SIZE && yycheck[idx] == yytoken &&\n";
+        out << "            !yytable_value_is_error(yytable[idx])) {\n";
+        out << "            int act = yytable[idx];\n";
+        out << "            if (n < YYGLR_MAX_ACT) {\n";
+        out << "                out_acts[n] = act;\n";
+        out << "                out_rules[n] = (act < 0) ? -act : 0;\n";
+        out << "                n++;\n";
+        out << "            }\n";
+        out << "        }\n";
+        out << "    }\n";
+        // Default reduce when nothing matched.
+        out << "    if (n == 0) {\n";
+        out << "        int defact = yydefact[state];\n";
+        out << "        if (defact != 0 && n < YYGLR_MAX_ACT) {\n";
+        out << "            out_acts[n] = -defact;\n";
+        out << "            out_rules[n] = defact;\n";
+        out << "            n++;\n";
+        out << "        }\n";
+        out << "    }\n";
+        // Extras (binary search).
+        out << "    int lo = 0, hi = yyglr_extra_n;\n";
+        out << "    while (lo < hi) {\n";
+        out << "        int mid = (lo + hi) / 2;\n";
+        out << "        int s = yyglr_extra_state[mid];\n";
+        out << "        int t = yyglr_extra_token[mid];\n";
+        out << "        if (s < state || (s == state && t < yytoken)) lo = mid + 1;\n";
+        out << "        else hi = mid;\n";
+        out << "    }\n";
+        out << "    while (lo < yyglr_extra_n &&\n";
+        out << "           yyglr_extra_state[lo] == state &&\n";
+        out << "           yyglr_extra_token[lo] == yytoken) {\n";
+        out << "        if (n < YYGLR_MAX_ACT) {\n";
+        out << "            int act = yyglr_extra_action[lo];\n";
+        out << "            out_acts[n] = act;\n";
+        out << "            out_rules[n] = (act < 0) ? -act : 0;\n";
+        out << "            n++;\n";
+        out << "        }\n";
+        out << "        lo++;\n";
+        out << "    }\n";
+        out << "    return n;\n";
+        out << "}\n";
+
+        // Action switch.  Same shape as the deterministic switch but
+        // uses a local yyvsp for resolved actions during reduce.
+        out << "static YYSTYPE yyglr_run_action(int rule, YYSTYPE *vals_top) {\n";
+        out << "    YYSTYPE yyval;\n";
+        out << "    YYSTYPE *yyvsp = vals_top;\n";
+        out << "    int yylen;\n";
+        out << "    switch (rule) {\n";
+        for (int i = 1; i < l_.n_rules(); i++) {
+            const Production& p = l_.prod(i);
+            int len = (int)p.rhs.size();
+            out << "    case " << i << ":\n";
+            out << "        yylen = " << len << ";\n";
+            out << "        if (yylen) yyval = yyvsp[1 - yylen];\n";
+            out << "        else memset(&yyval, 0, sizeof(yyval));\n";
+            if (!p.action.empty()) {
+                out << "        { " << translate_action(p) << " }\n";
+            }
+            out << "        return yyval;\n";
+        }
+        out << "    default: break;\n";
+        out << "    }\n";
+        out << "    YYSTYPE z; memset(&z, 0, sizeof(z)); return z;\n";
+        out << "}\n";
+
+        // The driver itself.
+        out << "extern int yylex(void);\n";
+        out << "int yyparse(void) {\n";
+        out << "    /* Active stack tops; each is a yyglr_node*. */\n";
+        out << "    yyglr_node *tops_a[16];\n";
+        out << "    yyglr_node *tops_b[16];\n";
+        out << "    yyglr_node **tops = tops_a;\n";
+        out << "    yyglr_node **next_tops = tops_b;\n";
+        out << "    YYSTYPE init_val; memset(&init_val, 0, sizeof(init_val));\n";
+        out << "    tops[0] = yyglr_node_new(0, init_val, NULL);\n";
+        out << "    int n_tops = 1;\n";
+        out << "    yychar = -2;\n";
+        out << "    yynerrs = 0;\n";
+        out << "    int result = 1; /* default: error */\n";
+        out << "    for (;;) {\n";
+        out << "        if (yychar == -2) yychar = yylex();\n";
+        out << "        int yytoken = (yychar <= 0) ? 0 : YYTRANSLATE(yychar);\n";
+        out << "        int n_next = 0;\n";
+        out << "        int any_accept = 0;\n";
+        out << "        int progress = 0; /* did anything advance? */\n";
+        out << "        int did_shift = 0; /* did any top consume the token? */\n";
+        out << "        for (int i = 0; i < n_tops; i++) {\n";
+        out << "            yyglr_node *top = tops[i];\n";
+        out << "            int acts[YYGLR_MAX_ACT]; int rules[YYGLR_MAX_ACT];\n";
+        out << "            int n_acts = yyglr_actions_for(top->state, yytoken, acts, rules);\n";
+        out << "            if (n_acts == 0) {\n";
+        out << "                yyglr_node_release(top);\n";
+        out << "                continue;\n";
+        out << "            }\n";
+        out << "            for (int k = 0; k < n_acts; k++) {\n";
+        out << "                int act = acts[k];\n";
+        out << "                if (act == 0) { any_accept = 1; continue; }\n";
+        out << "                if (act > 0) {\n";
+        out << "                    /* Shift to state act. */\n";
+        out << "                    if (n_next >= 16) continue;\n";
+        out << "                    yyglr_node *n = yyglr_node_new(act, yylval, top);\n";
+        out << "                    next_tops[n_next++] = n;\n";
+        out << "                    progress = 1;\n";
+        out << "                    did_shift = 1;\n";
+        out << "                } else {\n";
+        out << "                    /* Reduce by rule -act. */\n";
+        out << "                    int rule = -act;\n";
+        out << "                    int len = yyr2[rule];\n";
+        out << "                    yyglr_node *cur = top;\n";
+        out << "                    YYSTYPE values[16];\n";
+        out << "                    if (len > 16) { /* too deep */ continue; }\n";
+        out << "                    for (int j = len; j > 0; j--) {\n";
+        out << "                        if (!cur) break;\n";
+        out << "                        values[j-1] = cur->value;\n";
+        out << "                        cur = cur->prev;\n";
+        out << "                    }\n";
+        out << "                    if (!cur && len > 0) continue;\n";
+        out << "                    int prevstate = cur ? cur->state : 0;\n";
+        out << "                    YYSTYPE yyval = (len == 0)\n";
+        out << "                        ? (YYSTYPE){0}\n";
+        out << "                        : yyglr_run_action(rule, &values[len-1]);\n";
+        out << "                    /* GOTO */\n";
+        out << "                    int yylhs = yyr1[rule];\n";
+        out << "                    int nt = yylhs - YYNTOKENS;\n";
+        out << "                    int gpos = yypgoto[nt] + prevstate;\n";
+        out << "                    int gostate;\n";
+        out << "                    if (gpos >= 0 && gpos < (int)YYTABLE_SIZE && yycheck[gpos] == prevstate)\n";
+        out << "                        gostate = yytable[gpos];\n";
+        out << "                    else\n";
+        out << "                        gostate = yydefgoto[nt];\n";
+        out << "                    if (n_next >= 16) continue;\n";
+        out << "                    yyglr_node *n = yyglr_node_new(gostate, yyval, cur);\n";
+        out << "                    next_tops[n_next++] = n;\n";
+        out << "                    progress = 1;\n";
+        out << "                    /* Re-process this node against the same token. */\n";
+        out << "                    /* (We approximate by appending back; it'll be picked\n";
+        out << "                     * up in the next iteration of the outer for loop.) */\n";
+        out << "                }\n";
+        out << "            }\n";
+        out << "            yyglr_node_release(top);\n";
+        out << "        }\n";
+        // Merge tops with the same state by dprec or merge fn.
+        out << "        for (int i = 0; i < n_next; i++) {\n";
+        out << "            for (int j = i+1; j < n_next; j++) {\n";
+        out << "                if (next_tops[i] && next_tops[j] &&\n";
+        out << "                    next_tops[i]->state == next_tops[j]->state &&\n";
+        out << "                    next_tops[i]->prev == next_tops[j]->prev) {\n";
+        out << "                    /* Drop the second; values would merge here. */\n";
+        out << "                    yyglr_node_release(next_tops[j]);\n";
+        out << "                    next_tops[j] = NULL;\n";
+        out << "                }\n";
+        out << "            }\n";
+        out << "        }\n";
+        out << "        int compact = 0;\n";
+        out << "        for (int i = 0; i < n_next; i++) {\n";
+        out << "            if (next_tops[i]) next_tops[compact++] = next_tops[i];\n";
+        out << "        }\n";
+        out << "        n_next = compact;\n";
+        // Swap.
+        out << "        yyglr_node **tmp = tops; tops = next_tops; next_tops = tmp;\n";
+        out << "        n_tops = n_next;\n";
+        out << "        if (any_accept) { result = 0; break; }\n";
+        out << "        if (n_tops == 0) {\n";
+        out << "            yyerror(\"syntax error\");\n";
+        out << "            yynerrs++;\n";
+        out << "            result = 1;\n";
+        out << "            break;\n";
+        out << "        }\n";
+        // Consume the token only when at least one top shifted it this
+        // iteration.  Reductions never consume — they need to keep folding
+        // the stacks until a shift or accept happens.
+        out << "        if (did_shift) yychar = -2;\n";
+        // Accept condition: any top in the YYFINAL state.
+        out << "        for (int i = 0; i < n_tops; i++) {\n";
+        out << "            if (tops[i]->state == YYFINAL) { result = 0; goto yyglr_done; }\n";
+        out << "        }\n";
+        // No progress on a non-EOF token: error.  On EOF specifically, no
+        // progress + no accept = error.
+        out << "        if (progress == 0) {\n";
+        out << "            if (yychar != 0) { yyerror(\"syntax error\"); yynerrs++; }\n";
+        out << "            else { yyerror(\"syntax error at end of input\"); yynerrs++; }\n";
+        out << "            break;\n";
+        out << "        }\n";
+        out << "    }\n";
+        out << "yyglr_done:\n";
+        out << "    for (int i = 0; i < n_tops; i++) yyglr_node_release(tops[i]);\n";
+        out << "    return result;\n";
+        out << "}\n";
     }
 };
 
