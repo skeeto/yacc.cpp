@@ -648,9 +648,39 @@ private:
                 advance();
                 if (at(Tok::StrLit)) { g_.api_prefix = peek_.text; advance(); }
                 return;
+            case Tok::PercentRequire:
+                advance();
+                if (at(Tok::StrLit)) {
+                    // Compare requested "X.Y[.Z]" against our reported
+                    // version.  Fail if the user requires a strictly higher
+                    // version.  Bison accepts lower versions silently.
+                    // We report a high version (3.8.0) so existing grammars
+                    // that say %require "3.0" or similar continue to work.
+                    static const int our_major = 3, our_minor = 8, our_patch = 0;
+                    int rmaj = 0, rmin = 0, rpat = 0;
+                    const string& v = peek_.text;
+                    size_t p = 0;
+                    auto parse_int = [&]() {
+                        int n = 0;
+                        while (p < v.size() && ch_isdigit((unsigned char)v[p])) {
+                            n = n * 10 + (v[p] - '0'); p++;
+                        }
+                        return n;
+                    };
+                    rmaj = parse_int();
+                    if (p < v.size() && v[p] == '.') { p++; rmin = parse_int(); }
+                    if (p < v.size() && v[p] == '.') { p++; rpat = parse_int(); }
+                    bool too_high =
+                        (rmaj > our_major) ||
+                        (rmaj == our_major && rmin > our_minor) ||
+                        (rmaj == our_major && rmin == our_minor && rpat > our_patch);
+                    if (too_high)
+                        fatalf("require {} but yacc.cpp is 3.8.0", v);
+                    advance();
+                }
+                return;
             case Tok::PercentLanguage:
             case Tok::PercentSkeleton:
-            case Tok::PercentRequire:
             case Tok::PercentOutput:
             case Tok::PercentFilePrefix:
                 advance();
@@ -1878,6 +1908,22 @@ private:
         out << "#define yyerrok (yyerrstatus = 0)\n";
         out << "#define yyclearin (yychar = -2)\n";
         out << "#define YYFINAL " << l_.final_state() << "\n";
+        // YYBACKUP: push a token back onto the lookahead position.
+        // Constraints (from Bison): action must be at end of rule and there
+        // must be no current lookahead (yychar == YYEMPTY).  Violating either
+        // is a runtime YYERROR.
+        out << "#define YYBACKUP(Tok, Val)                                       \\\n";
+        out << "    do                                                           \\\n";
+        out << "        if (yychar == -2 && yylen == 1)                          \\\n";
+        out << "        { yychar = (Tok); yylval = (Val);                        \\\n";
+        out << "          yytoken = YYTRANSLATE(yychar);                         \\\n";
+        out << "          YYPOPSTACK(1); goto yybackup; }                        \\\n";
+        out << "        else { yyerror(\"syntax error: cannot back up\");        \\\n";
+        out << "               YYERROR; }                                        \\\n";
+        out << "    while (0)\n";
+        out << "#define YYPOPSTACK(N) (yyssp -= (N), yyvsp -= (N)";
+        if (g_.want_locations) out << ", yylsp -= (N)";
+        out << ")\n";
     }
 
     template <class T>
