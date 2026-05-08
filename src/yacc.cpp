@@ -249,6 +249,7 @@ struct Options {
     bool verbose = false;
     bool want_graph = false;     // -g
     bool want_xml = false;       // -x
+    bool want_counterexamples = false; // -Wcounterexamples
     string graph_path;           // optional path passed to -g
     string xml_path;             // optional path passed to -x
     bool debug = false;
@@ -1241,6 +1242,12 @@ private:
     // to State::items.  Empty for LALR builds (which use compute_lookaheads
     // and then expand via compute_ext_items at build_action_goto time).
     vector<vector<std::set<int>>> items_la_;
+public:
+    // Per-conflict info for counter-example reporting.  Each entry is
+    // (state, terminal-internal-index, kind) where kind=1 is S/R, kind=2 is R/R.
+    struct Conflict { int state; int term_internal; int kind; };
+    vector<Conflict> conflicts;
+private:
 
     vector<int> term_internal_;
     vector<int> nonterm_internal_;
@@ -1767,12 +1774,14 @@ private:
                             (void)tok_assoc;
                         } else {
                             sr_conflicts_++;
+                            conflicts.push_back({s, la, 1});
                             // default: prefer shift
                         }
                     } else {
                         // reduce/reduce
                         int existing_rule = -cur;
                         rr_conflicts_++;
+                        conflicts.push_back({s, la, 2});
                         if ((int)ei.core.prod < existing_rule) action_[idx] = red;
                     }
                 }
@@ -3613,6 +3622,59 @@ static string write_xml(const Grammar& g, const LALR& l) {
     return s;
 }
 
+// Basic counter-example: for each conflict (state, token), do a BFS from
+// state 0 over the transitions to find a shortest path to the conflict
+// state, then print the path's symbol sequence followed by the lookahead
+// at the dot.  This is a simpler diagnostic than Bison's full
+// Isradisaikul/Myers (PLDI 2015) algorithm, but enough to point the user
+// at what input triggers the conflict.
+static string write_counterexamples(const Grammar& g, const LALR& l) {
+    if (l.conflicts.empty()) return string();
+    // BFS: predecessor map per state.  states_ has trans (sym -> dst).  We
+    // walk forward from 0 and record predecessor + entering-symbol.
+    int n = l.n_states();
+    vector<int> prev(n, -1);
+    vector<int> via(n, -1);
+    vector<bool> seen(n, false);
+    std::vector<int> q = {0};
+    seen[0] = true;
+    for (size_t i = 0; i < q.size(); i++) {
+        int s = q[i];
+        for (auto& [X, dst] : l.state(s).trans) {
+            if (seen[dst]) continue;
+            seen[dst] = true;
+            prev[dst] = s;
+            via[dst] = X;
+            q.push_back(dst);
+        }
+    }
+    auto path_to = [&](int s) -> string {
+        vector<int> syms;
+        for (int cur = s; cur > 0; cur = prev[cur]) {
+            if (via[cur] >= 0) syms.push_back(via[cur]);
+        }
+        std::reverse(syms.begin(), syms.end());
+        string out;
+        for (int sym : syms) {
+            if (!out.empty()) out += ' ';
+            out += g.syms[sym].display.empty() ? g.syms[sym].name : g.syms[sym].display;
+        }
+        return out;
+    };
+    string s;
+    Buf out{s};
+    for (const auto& c : l.conflicts) {
+        const char* kind = (c.kind == 1) ? "shift/reduce" : "reduce/reduce";
+        int sym = l.internal_to_sym(c.term_internal);
+        const string& tname = g.syms[sym].display.empty() ? g.syms[sym].name
+                                                           : g.syms[sym].display;
+        out << "yacc: " << kind << " conflict in state " << c.state
+            << " on " << tname << "\n";
+        out << "  Path: " << path_to(c.state) << " . " << tname << "\n";
+    }
+    return s;
+}
+
 // ============================================================================
 // CLI driver
 // ============================================================================
@@ -3650,6 +3712,10 @@ static int run(int argc, char** argv) {
         else if (a == "-h" || a == "--help") {
             write_stdout("Usage: yacc [OPTION]... FILE\n");
             return 0;
+        }
+        else if (a == "-Wcounterexamples" || a == "-Wcex" ||
+                 a == "--counterexamples") {
+            opts.want_counterexamples = true;
         }
         else if (starts("-W")) {}
         else if (starts("--color")) {}
@@ -3746,6 +3812,10 @@ static int run(int argc, char** argv) {
         write_stderr(std::format("yacc: {} shift/reduce conflict(s)\n", la.sr_conflicts()));
     if (la.rr_conflicts() > 0)
         write_stderr(std::format("yacc: {} reduce/reduce conflict(s)\n", la.rr_conflicts()));
+    // -Wcounterexamples: list each conflict with a sample input path.
+    if (opts.want_counterexamples && !la.conflicts.empty()) {
+        write_stderr(write_counterexamples(g, la));
+    }
     return 0;
 }
 

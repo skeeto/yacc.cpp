@@ -51,14 +51,14 @@ the optimization to land for users with very large grammars.
 
 ## Medium items
 
-### Counterexample generation (`-Wcounterexamples`)
+### Counterexample generation: full Isradisaikul/Myers algorithm
 
-For each shift/reduce or reduce/reduce conflict, find two derivations of one
-string (unifying counterexample) or two strings agreeing up to the conflict
-(non-unifying), and print "Example: ..." / "Shift derivation: ..." /
-"Reduce derivation: ...". Algorithm: Isradisaikul & Myers, PLDI 2015.
-Standalone module reading the LALR state graph, ~400 lines. No effect on
-runtime parser behaviour.
+Basic counterexamples are emitted (`-Wcounterexamples` / `-Wcex`): for each
+conflict we report the state, the conflicting token, and a path from the
+start state showing what input prefix leads there. Bison's PLDI 2015
+algorithm goes further: for unifying counterexamples it shows two
+derivations of one string, for non-unifying it shows two strings agreeing
+up to the conflict point. Useful but a 400-line standalone module.
 
 ### Better table compression (Bison's split shift/reduce displacement)
 
