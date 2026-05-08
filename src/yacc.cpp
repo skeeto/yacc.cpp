@@ -1485,6 +1485,7 @@ public:
             *hdr << tokens_s;
             *hdr << vt_s;
             *hdr << "extern YYSTYPE yylval;\n";
+            if (g_.want_locations) *hdr << "extern YYLTYPE yylloc;\n";
             *hdr << "int yyparse(void);\n";
             if (!g_.prologue_provides.empty())
                 *hdr << "/* %code provides */\n" << g_.prologue_provides << "\n";
@@ -1600,10 +1601,22 @@ private:
         out << "# define YYSTYPE_IS_TRIVIAL 1\n";
         out << "# define YYSTYPE_IS_DECLARED 1\n";
         out << "#endif\n";
+        if (g_.want_locations) {
+            out << "#if !defined YYLTYPE && !defined YYLTYPE_IS_DECLARED\n";
+            out << "typedef struct YYLTYPE {\n";
+            out << "  int first_line; int first_column;\n";
+            out << "  int last_line;  int last_column;\n";
+            out << "} YYLTYPE;\n";
+            out << "# define YYLTYPE_IS_TRIVIAL 1\n";
+            out << "# define YYLTYPE_IS_DECLARED 1\n";
+            out << "#endif\n";
+        }
     }
 
     void emit_constants(Buf out) {
         out << "YYSTYPE yylval;\nint yychar;\nint yynerrs;\n";
+        if (g_.want_locations)
+            out << "YYLTYPE yylloc;\n";
         out << "#ifndef YYDEBUG\n# define YYDEBUG 0\n#endif\n";
         out << "#if YYDEBUG\nint yydebug;\n#endif\n";
         out << "#define YYNTOKENS " << l_.n_terminals() << "\n";
@@ -1758,89 +1771,116 @@ private:
     }
 
     void emit_driver(Buf out) {
-        out <<
-R"(extern int yylex(void);
-#define YYTRANSLATE(c) ((0 <= (c) && (c) <= YYMAXUTOK) ? yytranslate[c] : 257)
-
-int yyparse(void) {
-    int yystate = 0;
-    int yyerrstatus = 0;
-    int yystacksize = YYINITDEPTH;
-    short *yyss = NULL;
-    YYSTYPE *yyvs = NULL;
-    short yyssa[YYINITDEPTH];
-    YYSTYPE yyvsa[YYINITDEPTH];
-    short *yyssp;
-    YYSTYPE *yyvsp;
-    int yyn;
-    int yyresult;
-    int yytoken = -2;
-    YYSTYPE yyval;
-    int yylen = 0;
-    yyss = yyssa; yyvs = yyvsa;
-    yyssp = yyss; yyvsp = yyvs;
-    *yyssp = 0;
-    yychar = -2;
-    yynerrs = 0;
-    goto yysetstate;
-
-yynewstate:
-    yyssp++;
-yysetstate:
-    *yyssp = (short)yystate;
-    if (yyss + yystacksize - 1 <= yyssp) {
-        long yysize = yyssp - yyss + 1;
-        if (yystacksize >= YYMAXDEPTH) goto yyexhaustedlab;
-        yystacksize *= 2;
-        if (yystacksize > YYMAXDEPTH) yystacksize = YYMAXDEPTH;
-        short *new_ss = (short*)malloc((size_t)yystacksize * sizeof(short));
-        YYSTYPE *new_vs = (YYSTYPE*)malloc((size_t)yystacksize * sizeof(YYSTYPE));
-        if (!new_ss || !new_vs) { free(new_ss); free(new_vs); goto yyexhaustedlab; }
-        memcpy(new_ss, yyss, (size_t)yysize * sizeof(short));
-        memcpy(new_vs, yyvs, (size_t)yysize * sizeof(YYSTYPE));
-        if (yyss != yyssa) { free(yyss); free(yyvs); }
-        yyss = new_ss; yyvs = new_vs;
-        yyssp = yyss + yysize - 1;
-        yyvsp = yyvs + yysize - 1;
-    }
-    if (yystate == YYFINAL) goto yyacceptlab;
-
-yybackup:
-    yyn = yypact[yystate];
-    if (yypact_value_is_default(yyn)) goto yydefault;
-    if (yychar == -2) yychar = yylex();
-    if (yychar <= 0) { yychar = 0; yytoken = 0; }
-    else if (yychar == 256) { yychar = 257; yytoken = YYTRANSLATE(257); goto yyerrlab1; }
-    else yytoken = YYTRANSLATE(yychar);
-    yyn += yytoken;
-    if (yyn < 0 || yyn >= (int)YYTABLE_SIZE || yycheck[yyn] != yytoken) goto yydefault;
-    yyn = yytable[yyn];
-    if (yyn <= 0) {
-        if (yytable_value_is_error(yyn)) goto yyerrlab;
-        if (yyn == 0) {
-            /* ACCEPT marker (only reachable if state has an explicit accept action) */
-            goto yyacceptlab;
+        const bool L = g_.want_locations;
+        out << "extern int yylex(void);\n";
+        out << "#define YYTRANSLATE(c) ((0 <= (c) && (c) <= YYMAXUTOK) ? yytranslate[c] : 257)\n";
+        if (L) {
+            out << "#ifndef YYLLOC_DEFAULT\n";
+            out << "# define YYLLOC_DEFAULT(Cur, Rhs, N)                              \\\n";
+            out << "    do                                                            \\\n";
+            out << "      if (N) {                                                    \\\n";
+            out << "        (Cur).first_line   = YYRHSLOC(Rhs, 1).first_line;         \\\n";
+            out << "        (Cur).first_column = YYRHSLOC(Rhs, 1).first_column;       \\\n";
+            out << "        (Cur).last_line    = YYRHSLOC(Rhs, N).last_line;          \\\n";
+            out << "        (Cur).last_column  = YYRHSLOC(Rhs, N).last_column;        \\\n";
+            out << "      } else {                                                    \\\n";
+            out << "        (Cur).first_line   = (Cur).last_line   =                  \\\n";
+            out << "          YYRHSLOC(Rhs, 0).last_line;                             \\\n";
+            out << "        (Cur).first_column = (Cur).last_column =                  \\\n";
+            out << "          YYRHSLOC(Rhs, 0).last_column;                           \\\n";
+            out << "      }                                                           \\\n";
+            out << "    while (0)\n";
+            out << "#endif\n";
+            out << "#define YYRHSLOC(Rhs, K) ((Rhs)[K])\n";
         }
-        yyn = -yyn;
-        goto yyreduce;
-    }
-    if (yyerrstatus) yyerrstatus--;
-    yystate = yyn;
-    *++yyvsp = yylval;
-    yychar = -2;
-    goto yynewstate;
-
-yydefault:
-    yyn = yydefact[yystate];
-    if (yyn == 0) goto yyerrlab;
-    goto yyreduce;
-
-yyreduce:
-    yylen = yyr2[yyn];
-    if (yylen) yyval = yyvsp[1 - yylen];
-    else memset(&yyval, 0, sizeof(yyval));
-    switch (yyn) {
-)";
+        out << "\n";
+        out << "int yyparse(void) {\n";
+        out << "    int yystate = 0;\n";
+        out << "    int yyerrstatus = 0;\n";
+        out << "    int yystacksize = YYINITDEPTH;\n";
+        out << "    short *yyss = NULL;\n";
+        out << "    YYSTYPE *yyvs = NULL;\n";
+        if (L) out << "    YYLTYPE *yyls = NULL;\n";
+        out << "    short yyssa[YYINITDEPTH];\n";
+        out << "    YYSTYPE yyvsa[YYINITDEPTH];\n";
+        if (L) out << "    YYLTYPE yylsa[YYINITDEPTH];\n";
+        out << "    short *yyssp;\n";
+        out << "    YYSTYPE *yyvsp;\n";
+        if (L) out << "    YYLTYPE *yylsp;\n";
+        out << "    int yyn;\n";
+        out << "    int yyresult;\n";
+        out << "    int yytoken = -2;\n";
+        out << "    YYSTYPE yyval;\n";
+        if (L) out << "    YYLTYPE yyloc;\n";
+        out << "    int yylen = 0;\n";
+        out << "    yyss = yyssa; yyvs = yyvsa;\n";
+        if (L) out << "    yyls = yylsa;\n";
+        out << "    yyssp = yyss; yyvsp = yyvs;\n";
+        if (L) out << "    yylsp = yyls;\n";
+        out << "    *yyssp = 0;\n";
+        out << "    yychar = -2;\n";
+        out << "    yynerrs = 0;\n";
+        out << "    goto yysetstate;\n";
+        out << "\n";
+        out << "yynewstate:\n";
+        out << "    yyssp++;\n";
+        out << "yysetstate:\n";
+        out << "    *yyssp = (short)yystate;\n";
+        out << "    if (yyss + yystacksize - 1 <= yyssp) {\n";
+        out << "        long yysize = yyssp - yyss + 1;\n";
+        out << "        if (yystacksize >= YYMAXDEPTH) goto yyexhaustedlab;\n";
+        out << "        yystacksize *= 2;\n";
+        out << "        if (yystacksize > YYMAXDEPTH) yystacksize = YYMAXDEPTH;\n";
+        out << "        short *new_ss = (short*)malloc((size_t)yystacksize * sizeof(short));\n";
+        out << "        YYSTYPE *new_vs = (YYSTYPE*)malloc((size_t)yystacksize * sizeof(YYSTYPE));\n";
+        if (L) out << "        YYLTYPE *new_ls = (YYLTYPE*)malloc((size_t)yystacksize * sizeof(YYLTYPE));\n";
+        out << "        if (!new_ss || !new_vs" << (L ? " || !new_ls" : "")
+            << ") { free(new_ss); free(new_vs);" << (L ? " free(new_ls);" : "") << " goto yyexhaustedlab; }\n";
+        out << "        memcpy(new_ss, yyss, (size_t)yysize * sizeof(short));\n";
+        out << "        memcpy(new_vs, yyvs, (size_t)yysize * sizeof(YYSTYPE));\n";
+        if (L) out << "        memcpy(new_ls, yyls, (size_t)yysize * sizeof(YYLTYPE));\n";
+        out << "        if (yyss != yyssa) { free(yyss); free(yyvs);" << (L ? " free(yyls);" : "") << " }\n";
+        out << "        yyss = new_ss; yyvs = new_vs;" << (L ? " yyls = new_ls;" : "") << "\n";
+        out << "        yyssp = yyss + yysize - 1;\n";
+        out << "        yyvsp = yyvs + yysize - 1;\n";
+        if (L) out << "        yylsp = yyls + yysize - 1;\n";
+        out << "    }\n";
+        out << "    if (yystate == YYFINAL) goto yyacceptlab;\n";
+        out << "\n";
+        out << "yybackup:\n";
+        out << "    yyn = yypact[yystate];\n";
+        out << "    if (yypact_value_is_default(yyn)) goto yydefault;\n";
+        out << "    if (yychar == -2) yychar = yylex();\n";
+        out << "    if (yychar <= 0) { yychar = 0; yytoken = 0; }\n";
+        out << "    else if (yychar == 256) { yychar = 257; yytoken = YYTRANSLATE(257); goto yyerrlab1; }\n";
+        out << "    else yytoken = YYTRANSLATE(yychar);\n";
+        out << "    yyn += yytoken;\n";
+        out << "    if (yyn < 0 || yyn >= (int)YYTABLE_SIZE || yycheck[yyn] != yytoken) goto yydefault;\n";
+        out << "    yyn = yytable[yyn];\n";
+        out << "    if (yyn <= 0) {\n";
+        out << "        if (yytable_value_is_error(yyn)) goto yyerrlab;\n";
+        out << "        if (yyn == 0) goto yyacceptlab;\n";
+        out << "        yyn = -yyn;\n";
+        out << "        goto yyreduce;\n";
+        out << "    }\n";
+        out << "    if (yyerrstatus) yyerrstatus--;\n";
+        out << "    yystate = yyn;\n";
+        out << "    *++yyvsp = yylval;\n";
+        if (L) out << "    *++yylsp = yylloc;\n";
+        out << "    yychar = -2;\n";
+        out << "    goto yynewstate;\n";
+        out << "\n";
+        out << "yydefault:\n";
+        out << "    yyn = yydefact[yystate];\n";
+        out << "    if (yyn == 0) goto yyerrlab;\n";
+        out << "    goto yyreduce;\n";
+        out << "\n";
+        out << "yyreduce:\n";
+        out << "    yylen = yyr2[yyn];\n";
+        out << "    if (yylen) yyval = yyvsp[1 - yylen];\n";
+        out << "    else memset(&yyval, 0, sizeof(yyval));\n";
+        if (L) out << "    YYLLOC_DEFAULT(yyloc, (yylsp - yylen), yylen);\n";
+        out << "    switch (yyn) {\n";
     }
 
     void emit_action_switch(Buf out) {
@@ -1857,6 +1897,12 @@ yyreduce:
         }
     }
 
+    // Local-only "is identifier continuation": for $name / @name we want
+    // alnum + underscore *but not '.'* (so "@t.first_line" parses @t then .first_line).
+    static bool ref_idcont(unsigned char c) {
+        return ch_isalnum(c) || c == '_';
+    }
+
     string translate_action(const Production& p) {
         string out;
         const string& s = p.action;
@@ -1869,6 +1915,74 @@ yyreduce:
         size_t i = 0;
         while (i < s.size()) {
             char c = s[i];
+            // Skip string and char literals verbatim — '$' and '@' inside them
+            // are user data, not parser-generator references.
+            if (c == '"' || c == '\'') {
+                char quote = c;
+                out += c; i++;
+                while (i < s.size()) {
+                    if (s[i] == '\\' && i + 1 < s.size()) {
+                        out += s[i]; i++;
+                        out += s[i]; i++;
+                        continue;
+                    }
+                    out += s[i];
+                    if (s[i] == quote) { i++; break; }
+                    i++;
+                }
+                continue;
+            }
+            // Skip block and line comments verbatim.
+            if (c == '/' && i + 1 < s.size() && s[i+1] == '/') {
+                while (i < s.size() && s[i] != '\n') { out += s[i]; i++; }
+                continue;
+            }
+            if (c == '/' && i + 1 < s.size() && s[i+1] == '*') {
+                out += s[i++]; out += s[i++];
+                while (i + 1 < s.size() && !(s[i] == '*' && s[i+1] == '/')) { out += s[i++]; }
+                if (i + 1 < s.size()) { out += s[i++]; out += s[i++]; }
+                continue;
+            }
+            // @-references: only expanded when locations are enabled.
+            if (c == '@' && g_.want_locations && i + 1 < s.size()) {
+                size_t j = i + 1;
+                if (s[j] == '$') {
+                    out += "(yyloc)";
+                    i = j + 1; continue;
+                }
+                if (ch_isdigit((unsigned char)s[j]) || s[j] == '-') {
+                    size_t k = j;
+                    if (s[k] == '-') k++;
+                    while (k < s.size() && ch_isdigit((unsigned char)s[k])) k++;
+                    int n = std::atoi(s.substr(j, k - j).c_str());
+                    int offset = n - eff_rhs_size;
+                    out += "(yylsp[";
+                    out += std::to_string(offset);
+                    out += "])";
+                    i = k; continue;
+                }
+                if (ch_isalpha((unsigned char)s[j]) || s[j] == '_') {
+                    size_t k = j;
+                    while (k < s.size() && ref_idcont((unsigned char)s[k])) k++;
+                    string nm = s.substr(j, k - j);
+                    if (!nm.empty() && nm == p.lhs_name) {
+                        out += "(yyloc)";
+                        i = k; continue;
+                    }
+                    int found = -1;
+                    for (int idx = 0; idx < (int)p.rhs_names.size(); idx++)
+                        if (p.rhs_names[idx] == nm && !nm.empty()) { found = idx; break; }
+                    if (found >= 0) {
+                        int offset = (found + 1) - (int)p.rhs.size();
+                        out += "(yylsp[";
+                        out += std::to_string(offset);
+                        out += "])";
+                        i = k; continue;
+                    }
+                }
+                // Unknown @form: emit verbatim.
+                out += c; i++; continue;
+            }
             if (c != '$') { out += c; i++; continue; }
             string tag;
             size_t j = i + 1;
@@ -1904,7 +2018,7 @@ yyreduce:
             }
             if (j < s.size() && (ch_isalpha((unsigned char)s[j]) || s[j] == '_')) {
                 size_t k = j;
-                while (k < s.size() && ch_isidcont((unsigned char)s[k])) k++;
+                while (k < s.size() && ref_idcont((unsigned char)s[k])) k++;
                 string nm = s.substr(j, k - j);
                 if (!nm.empty() && nm == p.lhs_name) {
                     out += "(yyval";
@@ -1934,63 +2048,66 @@ yyreduce:
     }
 
     void emit_driver_tail(Buf out) {
-        out <<
-R"(    }
-    yyssp -= yylen;
-    yyvsp -= yylen;
-    yylen = 0;
-    *++yyvsp = yyval;
-    {
-        int yylhs_internal = yyr1[yyn];
-        int nt = yylhs_internal - YYNTOKENS;
-        int gpos = yypgoto[nt] + *yyssp;
-        if (gpos >= 0 && gpos < (int)YYTABLE_SIZE && yycheck[gpos] == *yyssp)
-            yystate = yytable[gpos];
-        else
-            yystate = yydefgoto[nt];
-    }
-    goto yynewstate;
-
-yyerrlab:
-    if (!yyerrstatus) { ++yynerrs; yyerror("syntax error"); }
-yyerrorlab:
-    if (yyerrstatus == 3) {
-        if (yychar <= 0) goto yyabortlab;
-        yychar = -2;
-    }
-yyerrlab1:
-    yyerrstatus = 3;
-    for (;;) {
-        yyn = yypact[yystate];
-        if (!yypact_value_is_default(yyn)) {
-            int err_internal = )" << l_.error_internal() << R"(;
-            int idx = yyn + err_internal;
-            if (idx >= 0 && idx < (int)YYTABLE_SIZE && yycheck[idx] == err_internal) {
-                yyn = yytable[idx];
-                if (yyn > 0) {
-                    yystate = yyn;
-                    *++yyvsp = yylval;
-                    goto yynewstate;
-                }
-            }
-        }
-        if (yyssp == yyss) goto yyabortlab;
-        yyvsp--;
-        yystate = *--yyssp;
-    }
-
-yyacceptlab:
-    yyresult = 0; goto yyreturn;
-yyabortlab:
-    yyresult = 1; goto yyreturn;
-yyexhaustedlab:
-    yyerror("memory exhausted");
-    yyresult = 2; goto yyreturn;
-yyreturn:
-    if (yyss != yyssa) { free(yyss); free(yyvs); }
-    return yyresult;
-}
-)";
+        const bool L = g_.want_locations;
+        out << "    }\n";
+        out << "    yyssp -= yylen;\n";
+        out << "    yyvsp -= yylen;\n";
+        if (L) out << "    yylsp -= yylen;\n";
+        out << "    yylen = 0;\n";
+        out << "    *++yyvsp = yyval;\n";
+        if (L) out << "    *++yylsp = yyloc;\n";
+        out << "    {\n";
+        out << "        int yylhs_internal = yyr1[yyn];\n";
+        out << "        int nt = yylhs_internal - YYNTOKENS;\n";
+        out << "        int gpos = yypgoto[nt] + *yyssp;\n";
+        out << "        if (gpos >= 0 && gpos < (int)YYTABLE_SIZE && yycheck[gpos] == *yyssp)\n";
+        out << "            yystate = yytable[gpos];\n";
+        out << "        else\n";
+        out << "            yystate = yydefgoto[nt];\n";
+        out << "    }\n";
+        out << "    goto yynewstate;\n";
+        out << "\n";
+        out << "yyerrlab:\n";
+        out << "    if (!yyerrstatus) { ++yynerrs; yyerror(\"syntax error\"); }\n";
+        out << "yyerrorlab:\n";
+        out << "    if (yyerrstatus == 3) {\n";
+        out << "        if (yychar <= 0) goto yyabortlab;\n";
+        out << "        yychar = -2;\n";
+        out << "    }\n";
+        out << "yyerrlab1:\n";
+        out << "    yyerrstatus = 3;\n";
+        out << "    for (;;) {\n";
+        out << "        yyn = yypact[yystate];\n";
+        out << "        if (!yypact_value_is_default(yyn)) {\n";
+        out << "            int err_internal = " << l_.error_internal() << ";\n";
+        out << "            int idx = yyn + err_internal;\n";
+        out << "            if (idx >= 0 && idx < (int)YYTABLE_SIZE && yycheck[idx] == err_internal) {\n";
+        out << "                yyn = yytable[idx];\n";
+        out << "                if (yyn > 0) {\n";
+        out << "                    yystate = yyn;\n";
+        out << "                    *++yyvsp = yylval;\n";
+        if (L) out << "                    *++yylsp = yylloc;\n";
+        out << "                    goto yynewstate;\n";
+        out << "                }\n";
+        out << "            }\n";
+        out << "        }\n";
+        out << "        if (yyssp == yyss) goto yyabortlab;\n";
+        out << "        yyvsp--;\n";
+        if (L) out << "        yylsp--;\n";
+        out << "        yystate = *--yyssp;\n";
+        out << "    }\n";
+        out << "\n";
+        out << "yyacceptlab:\n";
+        out << "    yyresult = 0; goto yyreturn;\n";
+        out << "yyabortlab:\n";
+        out << "    yyresult = 1; goto yyreturn;\n";
+        out << "yyexhaustedlab:\n";
+        out << "    yyerror(\"memory exhausted\");\n";
+        out << "    yyresult = 2; goto yyreturn;\n";
+        out << "yyreturn:\n";
+        out << "    if (yyss != yyssa) { free(yyss); free(yyvs);" << (L ? " free(yyls);" : "") << " }\n";
+        out << "    return yyresult;\n";
+        out << "}\n";
     }
 };
 
