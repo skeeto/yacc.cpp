@@ -4177,16 +4177,65 @@ static string write_counterexamples(const Grammar& g, const LALR& l) {
         }
         return out;
     };
+    auto sym_name = [&](int sym) -> string {
+        return g.syms[sym].display.empty() ? g.syms[sym].name : g.syms[sym].display;
+    };
+    auto fmt_item = [&](const Item& item, int dot_override = -1) -> string {
+        const auto& prod = l.prod(item.prod);
+        int dot = (dot_override >= 0) ? dot_override : item.dot;
+        string r = g.syms[prod.lhs].name + " ->";
+        if (prod.rhs.empty()) r += " %empty";
+        for (int j = 0; j < (int)prod.rhs.size(); j++) {
+            if (j == dot) r += " .";
+            r += " " + sym_name(prod.rhs[j]);
+        }
+        if (dot == (int)prod.rhs.size()) r += " .";
+        return r;
+    };
     string s;
     Buf out{s};
     for (const auto& c : l.conflicts) {
+        const State& st = l.state(c.state);
         const char* kind = (c.kind == 1) ? "shift/reduce" : "reduce/reduce";
-        int sym = l.internal_to_sym(c.term_internal);
-        const string& tname = g.syms[sym].display.empty() ? g.syms[sym].name
-                                                           : g.syms[sym].display;
+        int tsym = l.internal_to_sym(c.term_internal);
+        const string& tname = sym_name(tsym);
+
         out << "yacc: " << kind << " conflict in state " << c.state
             << " on " << tname << "\n";
-        out << "  Path: " << path_to(c.state) << " . " << tname << "\n";
+        out << "  Example: " << path_to(c.state) << " . " << tname << "\n";
+
+        // Walk the state's full closure and show items that take action on
+        // this terminal: a shift item has the conflicting terminal right
+        // after the dot; a reduce item has dot at end with the terminal in
+        // its lookahead (kernel only — closure items inherit lookaheads
+        // from kernel, and listing the kernel is enough to identify the
+        // reductions involved).
+        bool printed_shift = false;
+        for (const auto& item : st.items) {
+            const auto& prod = l.prod(item.prod);
+            if ((int)item.dot >= (int)prod.rhs.size()) continue;
+            if (prod.rhs[item.dot] == tsym) {
+                if (!printed_shift) {
+                    out << "  Shift derivation:\n";
+                    printed_shift = true;
+                }
+                out << "    " << fmt_item(item) << "\n";
+            }
+        }
+        bool printed_reduce = false;
+        for (size_t i = 0; i < st.kernel.size(); i++) {
+            const auto& item = st.kernel[i];
+            const auto& prod = l.prod(item.prod);
+            if ((int)item.dot != (int)prod.rhs.size()) continue;
+            bool covers = (i < st.la.size())
+                       && (st.la[i].count(c.term_internal) > 0);
+            if (!covers) continue;
+            if (!printed_reduce) {
+                out << "  Reduce derivation:\n";
+                printed_reduce = true;
+            }
+            out << "    " << fmt_item(item) << "\n";
+        }
     }
     return s;
 }

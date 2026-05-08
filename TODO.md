@@ -51,12 +51,15 @@ the optimization to land for users with very large grammars.
 
 ### Counterexample generation: full Isradisaikul/Myers algorithm
 
-Basic counterexamples are emitted (`-Wcounterexamples` / `-Wcex`): for each
-conflict we report the state, the conflicting token, and a path from the
-start state showing what input prefix leads there. Bison's PLDI 2015
-algorithm goes further: for unifying counterexamples it shows two
-derivations of one string, for non-unifying it shows two strings agreeing
-up to the conflict point. Useful but a 400-line standalone module.
+Counterexamples (`-Wcounterexamples` / `-Wcex`) report the state, the
+conflicting token, an example prefix that reaches the state, and the
+conflicting items from the state's closure (shift derivation) and kernel
+(reduce derivation), so the user can see exactly which rules are in
+contention.  Bison's PLDI 2015 algorithm goes further: for unifying
+counterexamples it builds and prints two distinct derivations of one
+input string, for non-unifying it builds two input strings that agree
+up to the conflict point.  Adding the full unification search is what's
+left.
 
 ## Small items
 
