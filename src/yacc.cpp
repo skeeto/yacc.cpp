@@ -149,7 +149,11 @@ struct Grammar {
     int undef_sym = -1;
     int accept_sym = -1;
 
-    string prologue;
+    string prologue;       // %{ ... %} blocks BEFORE the first typed
+                           // declaration; emitted in source BEFORE YYSTYPE.
+    string prologue_late;  // %{ ... %} blocks AFTER the first typed
+                           // declaration; emitted in source AFTER YYSTYPE
+                           // (so they may reference YYSTYPE freely).
     string prologue_requires;
     string prologue_provides;
     string prologue_top;
@@ -488,6 +492,7 @@ private:
             {"verbose", Tok::PercentVerbose},
             {"yacc", Tok::PercentYacc},
             {"pure-parser", Tok::PercentPureParser},
+            {"pure_parser", Tok::PercentPureParser},  /* old underscore variant */
             {"glr-parser", Tok::PercentGlrParser},
             {"token-table", Tok::PercentToken_Table},
             {"no-lines", Tok::PercentNoLines},
@@ -634,7 +639,11 @@ private:
     void parse_declaration() {
         const Token t = peek_;
         switch (t.kind) {
-            case Tok::PercentBraces: g_.prologue += t.text; advance(); return;
+            case Tok::PercentBraces:
+                if (seen_typed_decl_) g_.prologue_late += t.text;
+                else                   g_.prologue      += t.text;
+                advance();
+                return;
             case Tok::PercentToken: advance(); parse_token_decl(Assoc::None); return;
             case Tok::PercentLeft:  advance(); parse_token_decl(Assoc::Left); return;
             case Tok::PercentRight: advance(); parse_token_decl(Assoc::Right); return;
@@ -865,6 +874,7 @@ private:
         if (!at(Tok::BraceBlock)) fatalf("%union: expected {{ at line {}", peek_.line);
         g_.union_body = peek_.text;
         g_.has_union = true;
+        seen_typed_decl_ = true;
         advance();
     }
 
@@ -880,7 +890,7 @@ private:
 
     void parse_type_decl() {
         string tag;
-        if (at(Tok::Tag)) { tag = peek_.text; advance(); }
+        if (at(Tok::Tag)) { tag = peek_.text; advance(); seen_typed_decl_ = true; }
         while (true) {
             int idx = -1;
             if (at(Tok::Identifier)) {
@@ -897,7 +907,7 @@ private:
     int next_prec_ = 0;
     void parse_token_decl(Assoc assoc) {
         string tag;
-        if (at(Tok::Tag)) { tag = peek_.text; advance(); }
+        if (at(Tok::Tag)) { tag = peek_.text; advance(); seen_typed_decl_ = true; }
         int prec_level = 0;
         if (assoc != Assoc::None) prec_level = ++next_prec_;
         bool any = false;
@@ -1087,6 +1097,9 @@ private:
     Grammar& g_;
     Options& opts_;
     Token peek_;
+    // True once we've seen %union or any typed %token/%type, after which
+    // %{ ... %} blocks go into prologue_late (emitted after YYSTYPE).
+    bool seen_typed_decl_ = false;
 };
 
 // ============================================================================
@@ -1764,6 +1777,13 @@ public:
         }
         out << tokens_s;
         out << vt_s;
+        // %{ %} blocks placed AFTER %union (or any typed decl) — bison's
+        // "second part of user prologue".  These may freely reference
+        // YYSTYPE because the typedef is already in scope.
+        if (!g_.prologue_late.empty()) {
+            if (!opts_.no_lines) out << "#line 1 \"" << g_.source_file << "\"\n";
+            out << g_.prologue_late << "\n";
+        }
 
         emit_constants(out);
         emit_translation_table(out);
@@ -2091,41 +2111,13 @@ private:
     }
 
     void emit_yyerror_default(Buf out) {
-        // Build a yyerror prototype/body matching the (possibly augmented)
-        // signature this parser will call: with %locations + pure mode it
-        // gains a leading YYLTYPE*; with %parse-param it threads those args
-        // through.  The default body just prints the message to stderr and
-        // ignores the rest; user-provided yyerror should match this same
-        // signature.  Marked weak so users can override.
-        out << "#if !defined YYERROR_USER_PROVIDED\n";
-        out << "#if defined(__GNUC__) || defined(__clang__)\n";
-        out << "__attribute__((weak))\n";
-        out << "#endif\n";
-        out << "void yyerror(";
-        bool first = true;
-        if (pure() && g_.want_locations) {
-            out << "YYLTYPE *yyllocp"; first = false;
-        }
-        for (auto& p : g_.parse_params) {
-            if (!first) out << ", ";
-            out << p;
-            first = false;
-        }
-        if (!first) out << ", ";
-        out << "const char *msg) {\n";
-        if (pure() && g_.want_locations) out << "    (void)yyllocp;\n";
-        for (auto& p : g_.parse_params) {
-            // Suppress unused-parameter warnings.
-            size_t end = p.find_last_not_of(" \t\r\n");
-            if (end == string::npos) continue;
-            size_t start = end;
-            while (start > 0 && (ch_isalnum((unsigned char)p[start - 1]) || p[start - 1] == '_'))
-                start--;
-            out << "    (void)" << p.substr(start, end - start + 1) << ";\n";
-        }
-        out << "    (void)fprintf(stderr, \"%s\\n\", msg);\n";
-        out << "}\n";
-        out << "#endif\n";
+        // Bison doesn't emit a default yyerror — the user must supply one
+        // (or link liby/-ly).  We follow the same convention so a grammar
+        // that defines its own static yyerror() in its prologue (like
+        // gettext's intl/plural.y) doesn't conflict with a generator-
+        // emitted weak symbol.  yyerror is declared in emit_driver above
+        // for the call sites; the actual body is the user's responsibility.
+        (void)out;
         // Verbose / detailed error: build a message naming the unexpected
         // token and the set of tokens that would be acceptable in this state,
         // walking yypact[]/yytable[]/yycheck[].
