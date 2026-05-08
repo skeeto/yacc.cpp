@@ -161,6 +161,13 @@ struct Grammar {
     bool want_locations = false;
     // %define parse.error: simple (default) | verbose | detailed | custom
     string parse_error_mode = "simple";
+    // %define api.pure / %pure-parser: false (default) | true | full
+    string api_pure = "false";
+    // %parse-param {type name} ... — appended to yyparse signature
+    // %lex-param   {type name} ... — passed to yylex calls (pure parsers)
+    // Stored as raw "type name" strings, one per brace block.
+    vector<string> parse_params;
+    vector<string> lex_params;
     string api_prefix;
     string token_prefix;
     int expected_sr = -1;
@@ -644,16 +651,33 @@ private:
             case Tok::PercentVerbose: advance(); opts_.verbose = true; return;
             case Tok::PercentYacc: advance(); opts_.yacc_compat = true; return;
             case Tok::PercentPureParser:
+                advance();
+                g_.api_pure = "full";
+                return;
             case Tok::PercentGlrParser:
                 advance(); return;
             case Tok::PercentToken_Table: advance(); opts_.token_table = true; return;
             case Tok::PercentNoLines: advance(); opts_.no_lines = true; return;
             case Tok::PercentParseParam:
             case Tok::PercentLexParam:
-            case Tok::PercentParam:
+            case Tok::PercentParam: {
+                Tok which = t.kind;
                 advance();
-                if (at(Tok::BraceBlock)) advance();
+                // Bison accepts multiple {TYPE NAME} blocks after one directive.
+                while (at(Tok::BraceBlock)) {
+                    string body = peek_.text;
+                    // Strip leading/trailing whitespace.
+                    size_t a = body.find_first_not_of(" \t\r\n");
+                    size_t b = body.find_last_not_of(" \t\r\n");
+                    body = (a == string::npos) ? string() : body.substr(a, b - a + 1);
+                    if (which != Tok::PercentLexParam)
+                        g_.parse_params.push_back(body);
+                    if (which != Tok::PercentParseParam)
+                        g_.lex_params.push_back(body);
+                    advance();
+                }
                 return;
+            }
             case Tok::PercentDestructor:
             case Tok::PercentPrinter:
             case Tok::PercentInitialAction:
@@ -688,11 +712,15 @@ private:
             else if (name == "api.prefix") g_.api_prefix = v;
             else if (name == "api.token.prefix") g_.token_prefix = v;
             else if (name == "parse.error") g_.parse_error_mode = v;
+            else if (name == "api.pure") g_.api_pure = v;
             advance();
         } else if (at(Tok::BraceBlock)) {
             string v = "{" + peek_.text + "}";
             if (name == "api.value.type") g_.api_value_type = v;
             advance();
+        } else {
+            // %define NAME (no value) — treat as "true".
+            if (name == "api.pure") g_.api_pure = "true";
         }
     }
 
@@ -1467,6 +1495,105 @@ public:
     Emitter(const Grammar& g, const LALR& l, const Options& o)
         : g_(g), l_(l), opts_(o) {}
 
+    // Pure parsers move yylval/yychar/yynerrs/yylloc out of globals.
+    bool pure() const {
+        return g_.api_pure == "true" || g_.api_pure == "full";
+    }
+
+    // ", type1 name1, type2 name2" — for appending to function signatures.
+    string params_decl(const vector<string>& v) const {
+        string s;
+        for (auto& p : v) { s += ", "; s += p; }
+        return s;
+    }
+
+    // Signature for yyparse — "void" if no params, else comma-joined.
+    string params_decl_signature() const {
+        if (g_.parse_params.empty()) return "void";
+        string s;
+        for (size_t i = 0; i < g_.parse_params.size(); i++) {
+            if (i) s += ", ";
+            s += g_.parse_params[i];
+        }
+        return s;
+    }
+
+    // ", name1, name2" — for appending to call sites.  Extracts the last
+    // identifier-like token of each "type name" declaration.
+    string params_call(const vector<string>& v) const {
+        string s;
+        for (auto& p : v) {
+            size_t end = p.find_last_not_of(" \t\r\n");
+            if (end == string::npos) continue;
+            size_t start = end;
+            while (start > 0 && (ch_isalnum((unsigned char)p[start - 1]) || p[start - 1] == '_'))
+                start--;
+            s += ", ";
+            s += p.substr(start, end - start + 1);
+        }
+        return s;
+    }
+
+    // Argument list for a yylex(...) call from inside yyparse.
+    string yylex_call_args() const {
+        string s;
+        bool first = true;
+        if (pure()) {
+            s += "&yylval";
+            first = false;
+            if (g_.want_locations) { s += ", &yylloc"; }
+        }
+        for (auto& p : g_.lex_params) {
+            size_t end = p.find_last_not_of(" \t\r\n");
+            if (end == string::npos) continue;
+            size_t start = end;
+            while (start > 0 && (ch_isalnum((unsigned char)p[start - 1]) || p[start - 1] == '_'))
+                start--;
+            if (!first) s += ", ";
+            s += p.substr(start, end - start + 1);
+            first = false;
+        }
+        return s;
+    }
+
+    // Extra arguments passed from yyerrlab to yysyntax_error so it can
+    // format the message and forward to user yyerror with the right ABI.
+    string yysyntax_error_extra_args() const {
+        string s;
+        if (pure() && g_.want_locations) s += ", &yylloc";
+        for (auto& p : g_.parse_params) {
+            size_t end = p.find_last_not_of(" \t\r\n");
+            if (end == string::npos) continue;
+            size_t start = end;
+            while (start > 0 && (ch_isalnum((unsigned char)p[start - 1]) || p[start - 1] == '_'))
+                start--;
+            s += ", ";
+            s += p.substr(start, end - start + 1);
+        }
+        return s;
+    }
+
+    // "name1, name2" — like params_call but without leading ", ".
+    string params_call_no_leading_comma(const vector<string>& v) const {
+        string s = params_call(v);
+        if (s.size() >= 2 && s[0] == ',' && s[1] == ' ') s.erase(0, 2);
+        return s;
+    }
+
+    // Argument list for a yyerror(...) call.  Pure parsers prepend &yylloc
+    // when locations are enabled, then any %parse-param identifiers, then
+    // the message string passed verbatim.
+    string yyerror_call_args(string_view msg_expr) const {
+        string s;
+        if (pure() && g_.want_locations) s += "&yylloc, ";
+        s += params_call(g_.parse_params);
+        // params_call leaves a leading ", "; strip if needed.
+        if (!s.empty() && s.front() == ',') s.erase(0, 2);
+        if (!s.empty()) s += ", ";
+        s += msg_expr;
+        return s;
+    }
+
     void emit(Buf out, Buf* hdr) {
         emit_prefix(out);
         if (hdr) emit_prefix(*hdr);
@@ -1487,9 +1614,11 @@ public:
                 *hdr << "/* %code requires */\n" << g_.prologue_requires << "\n";
             *hdr << tokens_s;
             *hdr << vt_s;
-            *hdr << "extern YYSTYPE yylval;\n";
-            if (g_.want_locations) *hdr << "extern YYLTYPE yylloc;\n";
-            *hdr << "int yyparse(void);\n";
+            if (!pure()) {
+                *hdr << "extern YYSTYPE yylval;\n";
+                if (g_.want_locations) *hdr << "extern YYLTYPE yylloc;\n";
+            }
+            *hdr << "int yyparse(" << params_decl_signature() << ");\n";
             if (!g_.prologue_provides.empty())
                 *hdr << "/* %code provides */\n" << g_.prologue_provides << "\n";
             *hdr << "#ifdef __cplusplus\n}\n#endif\n";
@@ -1617,9 +1746,11 @@ private:
     }
 
     void emit_constants(Buf out) {
-        out << "YYSTYPE yylval;\nint yychar;\nint yynerrs;\n";
-        if (g_.want_locations)
-            out << "YYLTYPE yylloc;\n";
+        if (!pure()) {
+            out << "YYSTYPE yylval;\nint yychar;\nint yynerrs;\n";
+            if (g_.want_locations)
+                out << "YYLTYPE yylloc;\n";
+        }
         out << "#ifndef YYDEBUG\n# define YYDEBUG 0\n#endif\n";
         out << "#if YYDEBUG\nint yydebug;\n#endif\n";
         out << "#define YYNTOKENS " << l_.n_terminals() << "\n";
@@ -1781,18 +1912,49 @@ private:
     }
 
     void emit_yyerror_default(Buf out) {
-        out <<
-            "#if !defined YYERROR_USER_PROVIDED\n"
-            "#if defined(__GNUC__) || defined(__clang__)\n"
-            "__attribute__((weak))\n"
-            "#endif\n"
-            "void yyerror(const char *msg) { (void)fprintf(stderr, \"%s\\n\", msg); }\n"
-            "#endif\n";
+        // Build a yyerror prototype/body matching the (possibly augmented)
+        // signature this parser will call: with %locations + pure mode it
+        // gains a leading YYLTYPE*; with %parse-param it threads those args
+        // through.  The default body just prints the message to stderr and
+        // ignores the rest; user-provided yyerror should match this same
+        // signature.  Marked weak so users can override.
+        out << "#if !defined YYERROR_USER_PROVIDED\n";
+        out << "#if defined(__GNUC__) || defined(__clang__)\n";
+        out << "__attribute__((weak))\n";
+        out << "#endif\n";
+        out << "void yyerror(";
+        bool first = true;
+        if (pure() && g_.want_locations) {
+            out << "YYLTYPE *yyllocp"; first = false;
+        }
+        for (auto& p : g_.parse_params) {
+            if (!first) out << ", ";
+            out << p;
+            first = false;
+        }
+        if (!first) out << ", ";
+        out << "const char *msg) {\n";
+        if (pure() && g_.want_locations) out << "    (void)yyllocp;\n";
+        for (auto& p : g_.parse_params) {
+            // Suppress unused-parameter warnings.
+            size_t end = p.find_last_not_of(" \t\r\n");
+            if (end == string::npos) continue;
+            size_t start = end;
+            while (start > 0 && (ch_isalnum((unsigned char)p[start - 1]) || p[start - 1] == '_'))
+                start--;
+            out << "    (void)" << p.substr(start, end - start + 1) << ";\n";
+        }
+        out << "    (void)fprintf(stderr, \"%s\\n\", msg);\n";
+        out << "}\n";
+        out << "#endif\n";
         // Verbose / detailed error: build a message naming the unexpected
         // token and the set of tokens that would be acceptable in this state,
         // walking yypact[]/yytable[]/yycheck[].
         if (g_.parse_error_mode == "verbose" || g_.parse_error_mode == "detailed") {
-            out << "static void yysyntax_error(int yystate, int yytoken) {\n";
+            out << "static void yysyntax_error(int yystate, int yytoken";
+            if (pure() && g_.want_locations) out << ", YYLTYPE *yyllocp";
+            for (auto& p : g_.parse_params) out << ", " << p;
+            out << ") {\n";
             out << "    char buf[512];\n";
             out << "    size_t off = 0;\n";
             out << "    int n = snprintf(buf + off, sizeof(buf) - off, \"syntax error\");\n";
@@ -1826,14 +1988,33 @@ private:
             out << "        if (off >= sizeof(buf)) { off = sizeof(buf) - 1; break; }\n";
             out << "    }\n";
             out << "    buf[off < sizeof(buf) ? off : sizeof(buf) - 1] = 0;\n";
-            out << "    yyerror(buf);\n";
+            out << "    yyerror(";
+            if (pure() && g_.want_locations) out << "yyllocp, ";
+            out << params_call_no_leading_comma(g_.parse_params);
+            if (!g_.parse_params.empty()) out << ", ";
+            out << "buf);\n";
             out << "}\n";
         }
     }
 
     void emit_driver(Buf out) {
         const bool L = g_.want_locations;
-        out << "extern int yylex(void);\n";
+        const bool P = pure();
+        // yylex prototype — pure parsers receive YYSTYPE*[, YYLTYPE*][, lex-params...].
+        out << "extern int yylex(";
+        if (P) {
+            out << "YYSTYPE *yylvalp";
+            if (L) out << ", YYLTYPE *yyllocp";
+        } else {
+            out << "void";
+        }
+        for (auto& p : g_.lex_params) out << ", " << p;
+        out << ");\n";
+        // yyerror prototype — pure parsers receive (YYLTYPE*[, parse-params...], const char*).
+        out << "void yyerror(";
+        if (P && L) out << "YYLTYPE *yyllocp, ";
+        for (auto& p : g_.parse_params) out << p << ", ";
+        out << "const char *msg);\n";
         out << "#define YYTRANSLATE(c) ((0 <= (c) && (c) <= YYMAXUTOK) ? yytranslate[c] : 257)\n";
         if (L) {
             out << "#ifndef YYLLOC_DEFAULT\n";
@@ -1855,7 +2036,13 @@ private:
             out << "#define YYRHSLOC(Rhs, K) ((Rhs)[K])\n";
         }
         out << "\n";
-        out << "int yyparse(void) {\n";
+        out << "int yyparse(" << params_decl_signature() << ") {\n";
+        if (P) {
+            out << "    YYSTYPE yylval;\n";
+            out << "    int yychar = -2;\n";
+            out << "    int yynerrs = 0;\n";
+            if (L) out << "    YYLTYPE yylloc;\n";
+        }
         out << "    int yystate = 0;\n";
         out << "    int yyerrstatus = 0;\n";
         out << "    int yystacksize = YYINITDEPTH;\n";
@@ -1911,7 +2098,7 @@ private:
         out << "yybackup:\n";
         out << "    yyn = yypact[yystate];\n";
         out << "    if (yypact_value_is_default(yyn)) goto yydefault;\n";
-        out << "    if (yychar == -2) yychar = yylex();\n";
+        out << "    if (yychar == -2) yychar = yylex(" << yylex_call_args() << ");\n";
         out << "    if (yychar <= 0) { yychar = 0; yytoken = 0; }\n";
         out << "    else if (yychar == 256) { yychar = 257; yytoken = YYTRANSLATE(257); goto yyerrlab1; }\n";
         out << "    else yytoken = YYTRANSLATE(yychar);\n";
@@ -2132,9 +2319,11 @@ private:
         const bool verbose = (g_.parse_error_mode == "verbose" ||
                               g_.parse_error_mode == "detailed");
         if (verbose) {
-            out << "    if (!yyerrstatus) { ++yynerrs; yysyntax_error(yystate, yytoken); }\n";
+            out << "    if (!yyerrstatus) { ++yynerrs; yysyntax_error(yystate, yytoken"
+                << yysyntax_error_extra_args() << "); }\n";
         } else {
-            out << "    if (!yyerrstatus) { ++yynerrs; yyerror(\"syntax error\"); }\n";
+            out << "    if (!yyerrstatus) { ++yynerrs; yyerror("
+                << yyerror_call_args("\"syntax error\"") << "); }\n";
         }
         out << "yyerrorlab:\n";
         out << "    if (yyerrstatus == 3) {\n";
@@ -2169,7 +2358,7 @@ private:
         out << "yyabortlab:\n";
         out << "    yyresult = 1; goto yyreturn;\n";
         out << "yyexhaustedlab:\n";
-        out << "    yyerror(\"memory exhausted\");\n";
+        out << "    yyerror(" << yyerror_call_args("\"memory exhausted\"") << ");\n";
         out << "    yyresult = 2; goto yyreturn;\n";
         out << "yyreturn:\n";
         out << "    if (yyss != yyssa) { free(yyss); free(yyvs);" << (L ? " free(yyls);" : "") << " }\n";

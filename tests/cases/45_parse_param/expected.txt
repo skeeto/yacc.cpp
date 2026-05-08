@@ -1,0 +1,3 @@
+running total: 10
+running total: 15
+running total: 22

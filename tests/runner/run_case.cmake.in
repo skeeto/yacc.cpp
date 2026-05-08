@@ -59,7 +59,8 @@ endif()
 
 execute_process(
     COMMAND ${C_COMPILER} -std=c11 -O0 -g -Wno-unused -Wno-implicit-fallthrough
-            -Wno-deprecated-non-prototype
+            -Wno-deprecated-non-prototype -Wno-implicit-function-declaration
+            -Wno-error=implicit-function-declaration
             -I${WORK_DIR} ${WORK_DIR}/grammar.tab.c ${WORK_DIR}/driver.c -o ${EXE}
     RESULT_VARIABLE CC_RC
     OUTPUT_VARIABLE CC_OUT
