@@ -2259,55 +2259,70 @@ private:
     }
 
     void emit_compressed_tables(Buf out) {
-        // Layout: per-state row of nT entries appended to yytable/yycheck.
-        // yypact[s] = base offset OR NINF (default-only).
-        // For state s and token t: yytable[base+t] holds action; yycheck[base+t] = t IFF
-        // state s has a real action for token t, else yycheck = -1 so the
-        //   "yycheck[idx] != yytoken" check filters out the hole.
-        // Gotos work the same way over states.
+        // First-fit packed displacement.  Each non-empty state's action row
+        // (the sparse list of (col, action) pairs) is placed at a base
+        // offset chosen so:
+        //
+        //   For every absolute index idx = base + col, c in 0..nT-1:
+        //     claimed[idx] != c
+        //
+        // where claimed[] tracks "this idx already has an entry whose
+        // column is c".  This stricter check (vs. only checking the
+        // claim's columns against the new row's columns) prevents the
+        // verbose-error walker / parser from getting false positives:
+        // state s probing yyn=base[s]+T where s has no entry at T
+        // necessarily lands on a cell with claimed[idx] != T, so the
+        // "yycheck[idx] == T" test fails and the lookup falls through
+        // to the default action.
+        //
+        // Goto rows pack into the same yytable using the same constraint
+        // but with state index as the "column".  yypgoto + state_idx
+        // looks up the goto target.
         const int NINF = -32768;
         int nT = l_.n_terminals();
         int nN = l_.n_nonterminals();
         int nS = l_.n_states();
         vector<int> yypact(nS, NINF), yypgoto(nN, NINF), yydefgoto(nN, 0);
         vector<int> yytable, yycheck;
+        // claimed[idx] = col of the entry placed at idx, or -1 if free.
+        // Parallel to yytable; grown as needed.
+        vector<int> claimed;
+        auto reserve = [&](int idx) {
+            if ((int)claimed.size() <= idx) {
+                claimed.resize(idx + 1, -1);
+                yytable.resize(idx + 1, NINF);
+                yycheck.resize(idx + 1, -1);
+            }
+        };
+        // Encode an action.  Returns nullopt for a hole (no entry).
+        auto encode_action = [&](int a) -> std::optional<int> {
+            if (a == 0) return std::nullopt;
+            if (a == LALR::ACCEPT) return 0; // never hit at runtime; YYFINAL covers accept
+            if (a == LALR::ERR_MARK) return NINF;
+            if (a > 0) return a - 1;     // shift dst
+            return a;                     // reduce
+        };
+
+        struct Row {
+            int row_id;     // state index for actions, nt index for gotos
+            bool is_goto;
+            int domain;     // nT for actions, nS for gotos
+            vector<std::pair<int, int>> entries; // (col, action_or_goto)
+            int default_goto = 0;        // for goto rows
+        };
+        vector<Row> rows;
+
         for (int s = 0; s < nS; s++) {
-            // Determine whether state has any action; if not, leave yypact[s] = NINF.
-            bool has_any = false;
+            Row r{s, false, nT, {}, 0};
             for (int t = 0; t < nT; t++) {
                 int a = l_.action(s, t);
-                if (a != 0) { has_any = true; break; }
+                if (a == 0) continue;
+                r.entries.push_back({t, a});
             }
-            if (!has_any) continue;
-            int base = (int)yytable.size();
-            yypact[s] = base;
-            for (int t = 0; t < nT; t++) {
-                int a = l_.action(s, t);
-                int enc;
-                int ck;
-                if (a == 0) {
-                    enc = NINF; ck = -1; // hole -> goto default
-                } else if (a == LALR::ACCEPT) {
-                    enc = 0; ck = t;     // not normally hit; yystate==YYFINAL handles accept
-                } else if (a == LALR::ERR_MARK) {
-                    enc = NINF; ck = t;  // explicit error (from %nonassoc) -> yytable_value_is_error
-                } else if (a > 0) {
-                    enc = a - 1; ck = t; // shift dst state
-                } else {
-                    enc = a; ck = t;     // reduce: -rule
-                }
-                yytable.push_back(enc);
-                yycheck.push_back(ck);
-            }
+            if (!r.entries.empty()) rows.push_back(std::move(r));
         }
-        // Goto table: per-nonterminal row of nS entries.
         for (int nt = 0; nt < nN; nt++) {
-            bool has_any = false;
-            for (int s = 0; s < nS; s++) if (l_.goto_tab(s, nt) != 0) { has_any = true; break; }
-            if (!has_any) { yypgoto[nt] = NINF; yydefgoto[nt] = 0; continue; }
-            int base = (int)yytable.size();
-            yypgoto[nt] = base;
-            // Pick a default goto: most frequent non-zero target (bison style).
+            Row r{nt, true, nS, {}, 0};
             std::map<int, int> freq;
             for (int s = 0; s < nS; s++) {
                 int g = l_.goto_tab(s, nt);
@@ -2315,15 +2330,74 @@ private:
             }
             int default_goto = 0, best = 0;
             for (auto& [g, n] : freq) if (n > best) { best = n; default_goto = g; }
+            r.default_goto = default_goto;
             yydefgoto[nt] = (default_goto == 0) ? 0 : (default_goto - 1);
             for (int s = 0; s < nS; s++) {
                 int g = l_.goto_tab(s, nt);
-                if (g == 0 || g == default_goto) {
-                    yytable.push_back(NINF); yycheck.push_back(-1);
+                if (g == 0 || g == default_goto) continue;
+                r.entries.push_back({s, g});
+            }
+            if (!r.entries.empty()) rows.push_back(std::move(r));
+        }
+        // Pack denser rows first.
+        std::stable_sort(rows.begin(), rows.end(),
+            [](const Row& a, const Row& b) {
+                return a.entries.size() > b.entries.size();
+            });
+
+        // Strict packing.
+        for (const Row& r : rows) {
+            int min_col = r.entries.front().first;
+            for (auto& e : r.entries) min_col = std::min(min_col, e.first);
+            int base = -min_col;
+            for (;;) {
+                bool ok = true;
+                // Check every column 0..domain-1 (not just r's columns):
+                //   claimed[base+col] must not equal col.
+                int last = base + r.domain - 1;
+                if (last >= (int)claimed.size()) {
+                    // Cells beyond claimed.size() are unclaimed by definition;
+                    // we only need to check up to claimed.size() - 1.
+                    last = (int)claimed.size() - 1;
+                }
+                for (int col = 0; col <= last - base && col < r.domain; col++) {
+                    int idx = base + col;
+                    if (idx < 0) { ok = false; break; }
+                    if (claimed[idx] == col) { ok = false; break; }
+                }
+                if (!ok) { base++; continue; }
+                // Also: r's used cols must be unclaimed (claimed == -1) at
+                // (base+col), so we can write our entry there.  The check
+                // above already covers col == claim_col, but other state's
+                // claim at idx with col' != col is fine.  However, we
+                // can't WRITE into a cell already used by another state
+                // (yytable cell holds another value).
+                for (auto& e : r.entries) {
+                    int idx = base + e.first;
+                    if (idx >= 0 && idx < (int)claimed.size() && claimed[idx] != -1) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok) break;
+                base++;
+            }
+            // Place.
+            for (auto& e : r.entries) {
+                int idx = base + e.first;
+                reserve(idx);
+                claimed[idx] = e.first;
+                if (r.is_goto) {
+                    yytable[idx] = e.second - 1;
+                    yycheck[idx] = e.first;
                 } else {
-                    yytable.push_back(g - 1); yycheck.push_back(s);
+                    auto enc = encode_action(e.second);
+                    yytable[idx] = enc ? *enc : NINF;
+                    yycheck[idx] = e.first;
                 }
             }
+            if (r.is_goto) yypgoto[r.row_id] = base;
+            else            yypact[r.row_id]  = base;
         }
         out << "#define YYPACT_NINF " << NINF << "\n";
         out << "#define yypact_value_is_default(Yyn) ((Yyn) == YYPACT_NINF)\n";
