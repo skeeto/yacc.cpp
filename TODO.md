@@ -27,17 +27,15 @@ machinery. Test infrastructure (`tests/runner/run_case.cmake.in`) needs a
 ### GLR: full Tomita GSS + locations + parse-params
 
 A basic tree-of-stacks GLR runtime is in place: `%glr-parser` / `%dprec` /
-`%merge` are captured, conflict actions are kept in a side table, and the
+`%merge` are captured, conflict actions are kept in a side table, the
 emitter produces a parallel runtime that forks at conflicts, prunes errored
-branches, and merges convergent branches. Limitations versus Bison's full GLR:
+branches, and merges convergent branches.  When two tops collapse, the
+resolver consults the user `%merge` function first and then `%dprec` (higher
+wins) before dropping arbitrarily.  Limitations versus Bison's full GLR:
 
 - Locations and `%parse-param` aren't plumbed through the GLR driver.
 - Top count and node-pop depth are bounded at compile-time (16); deeply
   ambiguous parses won't fit.
-- Merge resolution is simplified: when two tops collapse on the same state
-  with the same prev, the second is dropped without consulting `%dprec` or
-  the user `%merge` function.  The data is emitted (`yyglr_dprec[]`,
-  `yyglr_merge_value()`) so the resolver can be tightened in place.
 
 A full Tomita GSS implementation with shared prefixes and proper deferred-action
 semantics is the real target for grammars with deep ambiguity.

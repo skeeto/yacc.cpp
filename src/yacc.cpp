@@ -3586,6 +3586,17 @@ private:
 
         // %merge function names per rule.  We emit a switch+function
         // call indexed by rule.
+        // Bison %merge convention: the user's merger takes (YYSTYPE,
+        // YYSTYPE) by value and returns YYSTYPE.  Forward-declare each
+        // distinct mergerfn so the user can define it in any translation
+        // unit (or after the parser code).
+        std::set<std::string> declared;
+        for (int p = 0; p < l_.n_rules(); p++) {
+            const auto& prod = l_.prod(p);
+            if (!prod.merge_fn.empty() && declared.insert(prod.merge_fn).second)
+                out << "extern YYSTYPE " << prod.merge_fn
+                    << "(YYSTYPE, YYSTYPE);\n";
+        }
         out << "/* %merge per-rule resolver. */\n";
         out << "static int yyglr_merge_value(int rule, YYSTYPE *a, YYSTYPE *b, YYSTYPE *out) {\n";
         out << "    switch (rule) {\n";
@@ -3601,17 +3612,22 @@ private:
         out << "    (void)a; (void)b; (void)out; return 0;\n";
         out << "}\n";
 
-        // Tree-of-stacks node + parser.
+        // Tree-of-stacks node + parser.  last_rule is the rule the latest
+        // reduce used to produce this node (0 for shifts and the initial
+        // node), so the merge resolver can consult yyglr_dprec[] and
+        // yyglr_merge_value() when two tops collapse.
         out << "typedef struct yyglr_node {\n";
         out << "    int state;\n";
+        out << "    int last_rule;\n";
         out << "    YYSTYPE value;\n";
         out << "    struct yyglr_node *prev;\n";
         out << "    int refcount;\n";
         out << "} yyglr_node;\n";
 
-        out << "static yyglr_node *yyglr_node_new(int state, YYSTYPE value, yyglr_node *prev) {\n";
+        out << "static yyglr_node *yyglr_node_new(int state, int last_rule, YYSTYPE value, yyglr_node *prev) {\n";
         out << "    yyglr_node *n = (yyglr_node*)malloc(sizeof(*n));\n";
-        out << "    n->state = state; n->value = value; n->prev = prev;\n";
+        out << "    n->state = state; n->last_rule = last_rule;\n";
+        out << "    n->value = value; n->prev = prev;\n";
         out << "    n->refcount = 1;\n";
         out << "    if (prev) prev->refcount++;\n";
         out << "    return n;\n";
@@ -3708,7 +3724,7 @@ private:
         out << "    yyglr_node **tops = tops_a;\n";
         out << "    yyglr_node **next_tops = tops_b;\n";
         out << "    YYSTYPE init_val; memset(&init_val, 0, sizeof(init_val));\n";
-        out << "    tops[0] = yyglr_node_new(0, init_val, NULL);\n";
+        out << "    tops[0] = yyglr_node_new(0, 0, init_val, NULL);\n";
         out << "    int n_tops = 1;\n";
         out << "    yychar = -2;\n";
         out << "    yynerrs = 0;\n";
@@ -3734,7 +3750,7 @@ private:
         out << "                if (act > 0) {\n";
         out << "                    /* Shift to state act. */\n";
         out << "                    if (n_next >= 16) continue;\n";
-        out << "                    yyglr_node *n = yyglr_node_new(act, yylval, top);\n";
+        out << "                    yyglr_node *n = yyglr_node_new(act, 0, yylval, top);\n";
         out << "                    next_tops[n_next++] = n;\n";
         out << "                    progress = 1;\n";
         out << "                    did_shift = 1;\n";
@@ -3765,7 +3781,7 @@ private:
         out << "                    else\n";
         out << "                        gostate = yydefgoto[nt];\n";
         out << "                    if (n_next >= 16) continue;\n";
-        out << "                    yyglr_node *n = yyglr_node_new(gostate, yyval, cur);\n";
+        out << "                    yyglr_node *n = yyglr_node_new(gostate, rule, yyval, cur);\n";
         out << "                    next_tops[n_next++] = n;\n";
         out << "                    progress = 1;\n";
         out << "                    /* Re-process this node against the same token. */\n";
@@ -3775,13 +3791,36 @@ private:
         out << "            }\n";
         out << "            yyglr_node_release(top);\n";
         out << "        }\n";
-        // Merge tops with the same state by dprec or merge fn.
+        // Merge tops with the same (state, prev).  Two parses converged.
+        // Resolution order, matching Bison:
+        //   1. If both reductions name a %merge function, call it on the
+        //      two semantic values and keep the merged node.
+        //   2. Otherwise, if either side has a higher %dprec, that side
+        //      wins and the loser is dropped.
+        //   3. Otherwise (no dprec, no merge), drop the second arbitrarily.
         out << "        for (int i = 0; i < n_next; i++) {\n";
         out << "            for (int j = i+1; j < n_next; j++) {\n";
-        out << "                if (next_tops[i] && next_tops[j] &&\n";
-        out << "                    next_tops[i]->state == next_tops[j]->state &&\n";
-        out << "                    next_tops[i]->prev == next_tops[j]->prev) {\n";
-        out << "                    /* Drop the second; values would merge here. */\n";
+        out << "                if (!next_tops[i] || !next_tops[j]) continue;\n";
+        out << "                if (next_tops[i]->state != next_tops[j]->state ||\n";
+        out << "                    next_tops[i]->prev  != next_tops[j]->prev) continue;\n";
+        out << "                int ri = next_tops[i]->last_rule;\n";
+        out << "                int rj = next_tops[j]->last_rule;\n";
+        out << "                YYSTYPE merged;\n";
+        out << "                if (ri > 0 && rj > 0 &&\n";
+        out << "                    yyglr_merge_value(ri, &next_tops[i]->value,\n";
+        out << "                                          &next_tops[j]->value, &merged)) {\n";
+        out << "                    next_tops[i]->value = merged;\n";
+        out << "                    yyglr_node_release(next_tops[j]);\n";
+        out << "                    next_tops[j] = NULL;\n";
+        out << "                    continue;\n";
+        out << "                }\n";
+        out << "                int di = (ri > 0) ? yyglr_dprec[ri] : 0;\n";
+        out << "                int dj = (rj > 0) ? yyglr_dprec[rj] : 0;\n";
+        out << "                if (di < dj) {\n";
+        out << "                    yyglr_node_release(next_tops[i]);\n";
+        out << "                    next_tops[i] = next_tops[j];\n";
+        out << "                    next_tops[j] = NULL;\n";
+        out << "                } else {\n";
         out << "                    yyglr_node_release(next_tops[j]);\n";
         out << "                    next_tops[j] = NULL;\n";
         out << "                }\n";
