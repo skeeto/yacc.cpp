@@ -174,6 +174,11 @@ struct Grammar {
     // indices and YYTRANSLATE is the identity, removing the need for the
     // external-to-internal yytranslate[] lookup.
     bool api_token_raw = false;
+    // %define parse.lac: none (default) | full
+    // When full, the verbose error helper does an exploratory parse so the
+    // expected-token list excludes tokens that would default-reduce and
+    // then fail in a later state.  Only affects diagnostics.
+    string parse_lac = "none";
     // %define api.push-pull: pull (default) | push | both
     // - pull: only yyparse() is generated (calls yylex internally).
     // - push: only yypstate_new/yypush_parse/yypstate_delete are generated.
@@ -838,6 +843,7 @@ private:
                 g_.api_token_raw = (v == "true" || v == "1");
             }
             else if (name == "api.push-pull") g_.api_push_pull = v;
+            else if (name == "parse.lac") g_.parse_lac = v;
             else if (name == "api.location.type") g_.api_location_type = v;
             advance();
         } else if (at(Tok::BraceBlock)) {
@@ -1709,9 +1715,13 @@ public:
 
     // Extra arguments passed from yyerrlab to yysyntax_error so it can
     // format the message and forward to user yyerror with the right ABI.
-    string yysyntax_error_extra_args() const {
+    string yysyntax_error_extra_args(bool push = false) const {
         string s;
-        if (pure() && g_.want_locations) s += ", &yylloc";
+        if (g_.parse_lac == "full") {
+            if (push) s += ", yyps->yyss, yyps->yyssp";
+            else      s += ", yyss, yyssp";
+        }
+        if (pure() && g_.want_locations) s += push ? ", &yyps->yylloc" : ", &yylloc";
         for (auto& p : g_.parse_params) {
             size_t end = p.find_last_not_of(" \t\r\n");
             if (end == string::npos) continue;
@@ -2213,7 +2223,57 @@ private:
         // token and the set of tokens that would be acceptable in this state,
         // walking yypact[]/yytable[]/yycheck[].
         if (g_.parse_error_mode == "verbose" || g_.parse_error_mode == "detailed") {
+            // LAC simulator: returns 1 if 'yyx' would shift or accept after
+            // following the chain of default/no-context reductions starting
+            // from 'yystate', given the current state stack.  Returns 0 if
+            // it would error.  Operates on a scratch copy of the top of the
+            // stack so the real parser is not perturbed.
+            if (g_.parse_lac == "full") {
+                out << "static int yy_lac(const short *yyss, const short *yyssp,\n";
+                out << "                  int yystate, int yyx) {\n";
+                out << "    /* Copy enough of the state stack into a scratch buffer that\n";
+                out << "     * reductions can pop and goto without touching the real one. */\n";
+                out << "    short scratch[64];\n";
+                out << "    int sp = 0;\n";
+                out << "    long depth = yyssp - yyss;\n";
+                out << "    if (depth >= (long)(sizeof(scratch)/sizeof(scratch[0])) - 4)\n";
+                out << "        return 1; /* conservative: claim acceptable */\n";
+                out << "    for (long i = 0; i <= depth; i++) scratch[sp++] = yyss[i];\n";
+                out << "    int s = yystate;\n";
+                out << "    for (;;) {\n";
+                out << "        int yyn = yypact[s];\n";
+                out << "        if (!yypact_value_is_default(yyn)) {\n";
+                out << "            int yychk = yyn + yyx;\n";
+                out << "            if (yychk >= 0 && yychk < (int)YYTABLE_SIZE\n";
+                out << "                && yycheck[yychk] == yyx\n";
+                out << "                && !yytable_value_is_error(yytable[yychk])) {\n";
+                out << "                int act = yytable[yychk];\n";
+                out << "                if (act >= 0) return 1;        /* shift / accept */\n";
+                out << "                yyn = -act;                    /* reduce by yyn */\n";
+                out << "            } else { goto try_default; }\n";
+                out << "        } else {\n";
+                out << "          try_default:\n";
+                out << "            yyn = yydefact[s];\n";
+                out << "            if (yyn == 0) return 0;            /* error */\n";
+                out << "        }\n";
+                out << "        /* reduce by rule yyn */\n";
+                out << "        int len = yyr2[yyn];\n";
+                out << "        int lhs = yyr1[yyn] - YYNTOKENS;\n";
+                out << "        if (sp - len < 1) return 1; /* shouldn't happen */\n";
+                out << "        sp -= len;\n";
+                out << "        int gpos = yypgoto[lhs] + scratch[sp - 1];\n";
+                out << "        if (gpos >= 0 && gpos < (int)YYTABLE_SIZE && yycheck[gpos] == scratch[sp - 1])\n";
+                out << "            s = yytable[gpos];\n";
+                out << "        else\n";
+                out << "            s = yydefgoto[lhs];\n";
+                out << "        if (sp >= (int)(sizeof(scratch)/sizeof(scratch[0]))) return 1;\n";
+                out << "        scratch[sp++] = (short)s;\n";
+                out << "    }\n";
+                out << "}\n";
+            }
             out << "static void yysyntax_error(int yystate, int yytoken";
+            if (g_.parse_lac == "full")
+                out << ", const short *yyss, const short *yyssp";
             if (pure() && g_.want_locations) out << ", YYLTYPE *yyllocp";
             for (auto& p : g_.parse_params) out << ", " << p;
             out << ") {\n";
@@ -2238,6 +2298,9 @@ private:
             out << "                && !yytable_value_is_error(yytable[yychk])\n";
             out << "                && yyx != " << l_.error_internal() << "\n";
             out << "                && yyx != " << l_.undef_internal() << ") {\n";
+            if (g_.parse_lac == "full") {
+                out << "                if (!yy_lac(yyss, yyssp, yystate, yyx)) continue;\n";
+            }
             out << "                expected[count++] = yyx;\n";
             out << "            }\n";
             out << "        }\n";
@@ -3107,17 +3170,8 @@ private:
                               g_.parse_error_mode == "detailed");
         if (verbose) {
             out << "    if (!yyps->yyerrstatus) { ++yyps->yynerrs; "
-                << "yysyntax_error(yyps->yystate, yytoken";
-            if (pure() && L) out << ", &yyps->yylloc";
-            for (auto& p : g_.parse_params) {
-                size_t end = p.find_last_not_of(" \t\r\n");
-                if (end == string::npos) continue;
-                size_t start = end;
-                while (start > 0 && (ch_isalnum((unsigned char)p[start - 1]) || p[start - 1] == '_'))
-                    start--;
-                out << ", " << p.substr(start, end - start + 1);
-            }
-            out << "); }\n";
+                << "yysyntax_error(yyps->yystate, yytoken"
+                << yysyntax_error_extra_args(/*push=*/true) << "); }\n";
         } else {
             out << "    if (!yyps->yyerrstatus) { ++yyps->yynerrs; yyerror(";
             if (pure() && L) out << "&yyps->yylloc, ";
