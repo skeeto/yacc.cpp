@@ -781,8 +781,20 @@ private:
             }
             advance();
         } else if (at(Tok::BraceBlock)) {
-            string v = "{" + peek_.text + "}";
-            if (name == "api.value.type") g_.api_value_type = v;
+            // Braced value: keep raw braces for api.value.type but strip
+            // them for prefix-like settings whose value is the body.
+            string raw = peek_.text;
+            string trimmed;
+            for (char c : raw) if (c != ' ' && c != '\t' && c != '\r' && c != '\n') trimmed += c;
+            (void)trimmed;
+            string body = raw;
+            // Trim leading/trailing whitespace from body.
+            size_t a = body.find_first_not_of(" \t\r\n");
+            size_t b = body.find_last_not_of(" \t\r\n");
+            body = (a == string::npos) ? string() : body.substr(a, b - a + 1);
+            if (name == "api.value.type") g_.api_value_type = "{" + raw + "}";
+            else if (name == "api.prefix") g_.api_prefix = body;
+            else if (name == "api.token.prefix") g_.token_prefix = body;
             advance();
         } else {
             // %define NAME (no value) — treat as "true".
@@ -1665,6 +1677,13 @@ public:
         emit_prefix(out);
         if (hdr) emit_prefix(*hdr);
 
+        // %define api.prefix / %name-prefix: rename every yy* symbol via
+        // #define so the rest of the emitter can keep using literal names.
+        if (!g_.api_prefix.empty()) {
+            emit_api_prefix(out);
+            if (hdr) emit_api_prefix(*hdr);
+        }
+
         // Tokens & YYSTYPE: emitted in both header (if any) and source.
         std::string tokens_s, vt_s;
         Buf tokens{tokens_s};
@@ -1730,6 +1749,27 @@ private:
         out << "/* yacc.cpp generated parser */\n";
     }
 
+    // Emit `#define yy* <prefix>*` for each yy-prefixed symbol the parser
+    // exposes.  Bison uses this same trick — the rest of the generated code
+    // keeps writing literal `yyparse` / `yylval` and the preprocessor does
+    // the renaming.  Internal labels (yynewstate etc.) are local to the
+    // function body so the macro replacement is harmless there.
+    void emit_api_prefix(Buf out) {
+        // The user prefix REPLACES "yy".  So `%define api.prefix {foo_}`
+        // makes yyparse → foo_parse, yylval → foo_lval, etc.
+        const string& p = g_.api_prefix;
+        static const char* names[] = {
+            "parse", "lex", "error", "lval", "char", "nerrs", "debug",
+            "lloc", "tname", "table", "check", "pact", "pgoto", "defgoto",
+            "defact", "stos", "r1", "r2", "rline", "translate", "toknum",
+            "destruct", "symbol_print", "syntax_error",
+            nullptr
+        };
+        for (int i = 0; names[i]; i++) {
+            out << "#define yy" << names[i] << " " << p << names[i] << "\n";
+        }
+    }
+
     static string esc(const string& s) {
         std::string r;
         for (char c : s) {
@@ -1753,6 +1793,7 @@ private:
     }
 
     void emit_token_kinds(Buf out) {
+        const string& tp = g_.token_prefix;
         out << "#ifndef YYTOKENTYPE\n# define YYTOKENTYPE\n";
         out << "  enum yytokentype {\n";
         out << "    YYEMPTY = -2,\n";
@@ -1766,7 +1807,7 @@ private:
             if (sm.alias_of >= 0) continue;
             if (sm.name.empty()) continue;
             if (sm.name[0] == '\'' || sm.name[0] == '"' || sm.name[0] == '$') continue;
-            out << ",\n    " << sm.name << " = " << sm.code;
+            out << ",\n    " << tp << sm.name << " = " << sm.code;
         }
         out << "\n  };\n";
         out << "  typedef enum yytokentype yytoken_kind_t;\n";
@@ -1778,7 +1819,8 @@ private:
             if (s == g_.eof_sym || s == g_.error_sym || s == g_.undef_sym) continue;
             if (sm.name.empty()) continue;
             if (sm.name[0] == '\'' || sm.name[0] == '"' || sm.name[0] == '$') continue;
-            out << "#ifndef " << sm.name << "\n# define " << sm.name << " " << sm.code << "\n#endif\n";
+            out << "#ifndef " << tp << sm.name << "\n# define " << tp << sm.name
+                << " " << sm.code << "\n#endif\n";
         }
     }
 
