@@ -1,9 +1,9 @@
 # TODO
 
-Bison features that are recognized (parsed without error) but only partially
-implemented, or not implemented at all. Roughly grouped by effort.
+Bison features that are recognized but only partially implemented, or not
+implemented at all. Roughly grouped by effort.
 
-## Large items (each comparable in size to the existing implementation)
+## Large items
 
 ### C++ output skeleton (`%language "c++"`, `%skeleton "lalr1.cc"`)
 
@@ -18,26 +18,29 @@ C output. A full Bison-compatible `lalr1.cc` skeleton needs:
 - `%define api.token.constructor` and `api.value.automove`.
 - `parser::location` and `parser::position` classes when `%locations` is on,
   configurable via `%define api.location.type`.
-- A separate skeleton interface so the C and C++ paths can coexist
-  (`src/yacc.cpp:1615` `class Emitter` is the natural split point).
+- A separate skeleton interface so the C and C++ paths can coexist.
 
 Scale: at minimum +500 lines for the skeleton alone, more for the value-type
 machinery. Test infrastructure (`tests/runner/run_case.cmake.in`) needs a
 `driver.cc` codepath with `g++` instead of `cc`.
 
-### GLR parser (`%glr-parser`, `%dprec`, `%merge`)
+### GLR: full Tomita GSS + locations + parse-params
 
-Only `%glr-parser` is recognized; tables are still LALR(1) deterministic.
-A real GLR runtime needs:
+A basic tree-of-stacks GLR runtime is in place: `%glr-parser` / `%dprec` /
+`%merge` are captured, conflict actions are kept in a side table, and the
+emitter produces a parallel runtime that forks at conflicts, prunes errored
+branches, and merges convergent branches. Limitations versus Bison's full GLR:
 
-- A separate driver template that can fork into multiple parser instances on
-  unresolved conflicts, run them lock-step, prune branches that error, and
-  merge branches that converge to the same state.
-- Per-rule storage of `%dprec N` and `%merge <fn>` (`Production` struct,
-  `src/yacc.cpp:122`).
-- Resolution at merge points: highest `%dprec` wins; user-supplied merge
-  function combines semantic values.
-- New `emit_glr_driver` method; ~600 lines of new runtime.
+- Locations and `%parse-param` aren't plumbed through the GLR driver.
+- Top count and node-pop depth are bounded at compile-time (16); deeply
+  ambiguous parses won't fit.
+- Merge resolution is simplified: when two tops collapse on the same state
+  with the same prev, the second is dropped without consulting `%dprec` or
+  the user `%merge` function.  The data is emitted (`yyglr_dprec[]`,
+  `yyglr_merge_value()`) so the resolver can be tightened in place.
+
+A full Tomita GSS implementation with shared prefixes and proper deferred-action
+semantics is the real target for grammars with deep ambiguity.
 
 ### IELR(1) (`%define lr.type ielr`)
 
@@ -58,20 +61,6 @@ start state showing what input prefix leads there. Bison's PLDI 2015
 algorithm goes further: for unifying counterexamples it shows two
 derivations of one string, for non-unifying it shows two strings agreeing
 up to the conflict point. Useful but a 400-line standalone module.
-
-### Better table compression (Bison's split shift/reduce displacement)
-
-The current `emit_compressed_tables` (`src/yacc.cpp:1969`) uses a per-state
-row of `nT` entries when the row is non-empty. Bison's algorithm splits the
-action table into separate `yysindex` (shifts) and `yyrindex` (reduces)
-displacements that share a single `yytable`/`yycheck`, and packs rows greedily
-by descending density. Tables get markedly smaller for non-trivial grammars.
-
-A first attempt was reverted because the verbose-error walker
-(`yysyntax_error`) had false positives when first-fit packing let a state's
-lookup land in another state's cell whose `yycheck` happened to match. A
-correct implementation uses Bison's split shift/reduce trick where shifts
-and reduces don't overlap; then the verbose walker only consults `yysindex`.
 
 ## Small items
 
