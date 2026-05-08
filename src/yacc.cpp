@@ -1167,7 +1167,11 @@ public:
         augment_and_number();
         compute_nullable();
         compute_first();
-        if (g_.lr_type == "canonical-lr") {
+        // ielr's recognition power equals canonical-LR's (Denny/Malloy 2010);
+        // they only differ in the size of the resulting tables.  Until we
+        // implement the IELR state-splitting algorithm proper, route ielr
+        // through the canonical builder so the parser is correct.
+        if (g_.lr_type == "canonical-lr" || g_.lr_type == "ielr") {
             build_canonical_lr1();
         } else {
             build_lr0();

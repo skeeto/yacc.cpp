@@ -40,42 +40,14 @@ A real GLR runtime needs:
   function combines semantic values.
 - New emit_glr_driver method; ~600 lines of new runtime.
 
-### IELR(1) and canonical LR(1) (`%define lr.type ielr|canonical-lr`)
+### IELR(1) (`%define lr.type ielr`)
 
-Only LALR is built today. Plug-in points are in `LALR::build_lr0()` at
-`src/yacc.cpp:1303` and `compute_lookaheads()` at `src/yacc.cpp:1350`.
-
-- **canonical-lr**: build LR(1) item sets directly — each kernel item carries
-  its own lookahead set; states with the same core but different lookaheads
-  are kept separate. Tables blow up dramatically (50× for a Java grammar) so
-  this is gated on the directive.
-- **ielr**: Denny/Malloy three-phase split — generate LALR(1), annotate
-  states with the inadequacies introduced by merging, selectively split only
-  those states. Recognition power equals canonical LR(1) at near-LALR table
-  size. Roughly 200–400 lines.
-
-### LAC (`%define parse.lac full`)
-
-During error reporting (and before each default reduction in `full` mode),
-perform an exploratory parse on a copy of the state stack with the current
-lookahead, to determine the *true* expected-token set without false-broadening
-from default reductions. No semantic actions, I/O, or `yylex` happen during
-exploration. Affects only diagnostics, not parsing semantics.
-
-Plug-in point: `src/yacc.cpp` `emit_driver_tail` near the verbose
-`yysyntax_error` helper.
-
-### Push parser (`%define api.push-pull push|both`)
-
-The `yyparse` driver currently keeps all of its state in stack-allocated
-locals (`src/yacc.cpp:2298-2330`). For a push parser those need to live in a
-heap-allocated `yypstate` struct so each `yypush_parse(ps, token, lvalp[, locp])`
-call can return `YYPUSH_MORE` and resume on the next call.
-
-- New API surface: `yypstate_new()`, `yypush_parse()`, `yypstate_delete()`,
-  optionally `yypull_parse()` for `both` mode.
-- The cleanest implementation is to express the existing goto-laced driver
-  as a small state machine with a `next_action` enum dispatched in a switch.
+Currently routed through the canonical-LR(1) builder.  IELR's recognition
+power equals canonical LR(1) (Denny & Malloy 2010); the only difference is
+table size.  A real IELR implementation (Denny/Malloy three-phase
+algorithm: build LALR, annotate states with merging-induced inadequacies,
+selectively split affected states) yields near-LALR table sizes — that's
+the optimization to land for users with very large grammars.
 
 ## Medium items
 
