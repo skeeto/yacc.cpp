@@ -1766,6 +1766,21 @@ public:
                 if (g_.want_locations) *hdr << "extern YYLTYPE yylloc;\n";
             }
             *hdr << "int yyparse(" << params_decl_signature() << ");\n";
+            if (g_.parse_error_mode == "custom") {
+                // Forward-declare the public custom-parse-error API so
+                // user code (driver.c) can implement yyreport_syntax_error.
+                *hdr << "typedef int yysymbol_kind_t;\n";
+                *hdr << "typedef struct yypcontext_s yypcontext_t;\n";
+                *hdr << "yysymbol_kind_t yypcontext_token(const yypcontext_t *);\n";
+                *hdr << "int yypcontext_expected_tokens(const yypcontext_t *, yysymbol_kind_t *, int);\n";
+                if (g_.want_locations)
+                    *hdr << "const YYLTYPE *yypcontext_location(const yypcontext_t *);\n";
+                *hdr << "const char *yysymbol_name(yysymbol_kind_t);\n";
+                // User must implement this:
+                *hdr << "extern int yyreport_syntax_error(const yypcontext_t *";
+                for (auto& p : g_.parse_params) *hdr << ", " << p;
+                *hdr << ");\n";
+            }
             if (!g_.prologue_provides.empty())
                 *hdr << "/* %code provides */\n" << g_.prologue_provides << "\n";
             *hdr << "#ifdef __cplusplus\n}\n#endif\n";
@@ -2196,6 +2211,49 @@ private:
             out << params_call_no_leading_comma(g_.parse_params);
             if (!g_.parse_params.empty()) out << ", ";
             out << "buf);\n";
+            out << "}\n";
+        }
+        // Custom parse-error mode: define the yypcontext_t struct and
+        // the helper functions.  Non-static so user code can call them.
+        // Forward typedefs are also re-emitted here in case the user's
+        // source doesn't #include the generated .h.
+        if (g_.parse_error_mode == "custom") {
+            out << "typedef int yysymbol_kind_t;\n";
+            out << "typedef struct yypcontext_s yypcontext_t;\n";
+            out << "struct yypcontext_s {\n";
+            out << "    int yystate;\n";
+            out << "    int yytoken;\n";
+            if (g_.want_locations) out << "    YYLTYPE *yylocp;\n";
+            out << "};\n";
+            out << "yysymbol_kind_t yypcontext_token(const yypcontext_t *yyctx) {\n";
+            out << "    return yyctx->yytoken;\n";
+            out << "}\n";
+            if (g_.want_locations) {
+                out << "const YYLTYPE *yypcontext_location(const yypcontext_t *yyctx) {\n";
+                out << "    return yyctx->yylocp;\n";
+                out << "}\n";
+            }
+            out << "int yypcontext_expected_tokens(const yypcontext_t *yyctx,\n";
+            out << "        yysymbol_kind_t *yyarg, int yyargn) {\n";
+            out << "    int yyn = yypact[yyctx->yystate];\n";
+            out << "    int count = 0;\n";
+            out << "    if (!yypact_value_is_default(yyn)) {\n";
+            out << "        for (int yyx = 0; yyx < YYNTOKENS && count < yyargn; ++yyx) {\n";
+            out << "            int yychk = yyn + yyx;\n";
+            out << "            if (yychk >= 0 && yychk < (int)YYTABLE_SIZE\n";
+            out << "                && yycheck[yychk] == yyx\n";
+            out << "                && !yytable_value_is_error(yytable[yychk])\n";
+            out << "                && yyx != " << l_.error_internal() << "\n";
+            out << "                && yyx != " << l_.undef_internal() << ") {\n";
+            out << "                yyarg[count++] = yyx;\n";
+            out << "            }\n";
+            out << "        }\n";
+            out << "    }\n";
+            out << "    return count;\n";
+            out << "}\n";
+            out << "const char *yysymbol_name(yysymbol_kind_t k) {\n";
+            out << "    if (k >= 0 && k < YYNTOKENS + YYNNTS) return yytname[k];\n";
+            out << "    return \"?\";\n";
             out << "}\n";
         }
     }
@@ -2739,9 +2797,28 @@ private:
         out << "yyerrlab:\n";
         const bool verbose = (g_.parse_error_mode == "verbose" ||
                               g_.parse_error_mode == "detailed");
+        const bool custom = (g_.parse_error_mode == "custom");
         if (verbose) {
             out << "    if (!yyerrstatus) { ++yynerrs; yysyntax_error(yystate, yytoken"
                 << yysyntax_error_extra_args() << "); }\n";
+        } else if (custom) {
+            out << "    if (!yyerrstatus) {\n";
+            out << "        ++yynerrs;\n";
+            out << "        yypcontext_t yyctx;\n";
+            out << "        yyctx.yystate = yystate;\n";
+            out << "        yyctx.yytoken = yytoken;\n";
+            if (g_.want_locations) out << "        yyctx.yylocp = &yylloc;\n";
+            out << "        yyreport_syntax_error(&yyctx";
+            for (auto& p : g_.parse_params) {
+                size_t end = p.find_last_not_of(" \t\r\n");
+                if (end == string::npos) continue;
+                size_t start = end;
+                while (start > 0 && (ch_isalnum((unsigned char)p[start - 1]) || p[start - 1] == '_'))
+                    start--;
+                out << ", " << p.substr(start, end - start + 1);
+            }
+            out << ");\n";
+            out << "    }\n";
         } else {
             out << "    if (!yyerrstatus) { ++yynerrs; yyerror("
                 << yyerror_call_args("\"syntax error\"") << "); }\n";
