@@ -88,15 +88,6 @@ string (unifying counterexample) or two strings agreeing up to the conflict
 Standalone module reading the LALR state graph, ~400 lines. No effect on
 runtime parser behaviour.
 
-### Graph and XML report (`-g`, `-x`)
-
-`-v` (the textual `.output` report) is implemented at `src/yacc.cpp` near
-`write_report`. Still needed:
-
-- `-g`: emit Graphviz `.dot` of the LR automaton (state nodes, labelled
-  shift/goto edges).
-- `-x`: emit Bison-compatible XML of states / items / transitions.
-
 ### Better table compression (Bison's split shift/reduce displacement)
 
 The current `emit_compressed_tables` (`src/yacc.cpp:1969`) uses a per-state
@@ -111,15 +102,6 @@ lookup land in another state's cell whose `yycheck` happened to match. A
 correct implementation either tightens the walker (also confirm the entry
 belongs to `yystate` via `yypact`) or relies on Bison's split shift/reduce
 trick where shifts and reduces don't overlap.
-
-### Multiple parsers in one program: extra `api.prefix` care
-
-`api.prefix` works for symbol renaming via `#define`. For full
-"two-parsers-in-one-binary" support Bison also renames `YYSTYPE`, `YYLTYPE`,
-and `YYDEBUG` to uppercase variants of the prefix. Currently those types stay
-named `YYSTYPE` etc., so two parsers in one TU collide on type names. Fix is
-small: extend `emit_api_prefix` (`src/yacc.cpp` near 1738) to emit uppercase
-type renames.
 
 ## Small items
 
@@ -137,20 +119,6 @@ on the C++ skeleton + the destructor infrastructure already in place.
 
 Tokens become typed values constructed through `make_NAME(value)` factory
 functions. Pairs with `api.value.type variant`. C++ only.
-
-### Custom `parse.error` mode (`%define parse.error custom`)
-
-Today `simple`, `verbose`, and `detailed` are wired up. `custom` should call a
-user-supplied `yyreport_syntax_error(yypcontext_t *ctx)` instead of building
-a message itself. Needs a small `yypcontext_*` API: `yypcontext_token`,
-`yypcontext_expected_tokens`, `yypcontext_location`. Plug-in at
-`emit_yyerror_default` (`src/yacc.cpp:1981`).
-
-### `%define api.location.type {...}`
-
-The directive parses but the value is ignored — `YYLTYPE` is always the
-default 4-int struct. Should honour the user's typedef instead. Touches
-`emit_value_type` (`src/yacc.cpp:1813`).
 
 ### Other output languages (D, Java)
 
