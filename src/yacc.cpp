@@ -162,6 +162,9 @@ struct Grammar {
     bool has_union = false;
     string api_value_type;
     string api_value_union_name;
+    // %define api.location.type {custom_type} replaces the default 4-int
+    // YYLTYPE struct with `typedef custom_type YYLTYPE;`.
+    string api_location_type;
     bool want_locations = false;
     // %define parse.error: simple (default) | verbose | detailed | custom
     string parse_error_mode = "simple";
@@ -825,6 +828,7 @@ private:
             else if (name == "api.token.raw") {
                 g_.api_token_raw = (v == "true" || v == "1");
             }
+            else if (name == "api.location.type") g_.api_location_type = v;
             advance();
         } else if (at(Tok::BraceBlock)) {
             // Braced value: keep raw braces for api.value.type but strip
@@ -841,6 +845,7 @@ private:
             if (name == "api.value.type") g_.api_value_type = "{" + raw + "}";
             else if (name == "api.prefix") g_.api_prefix = body;
             else if (name == "api.token.prefix") g_.token_prefix = body;
+            else if (name == "api.location.type") g_.api_location_type = body;
             advance();
         } else {
             // %define NAME (no value) — treat as "true".
@@ -1937,11 +1942,19 @@ private:
         out << "#endif\n";
         if (g_.want_locations) {
             out << "#ifndef YYLTYPE_IS_DECLARED\n";
-            out << "typedef struct YYLTYPE {\n";
-            out << "  int first_line; int first_column;\n";
-            out << "  int last_line;  int last_column;\n";
-            out << "} YYLTYPE;\n";
-            out << "# define YYLTYPE_IS_TRIVIAL 1\n";
+            if (!g_.api_location_type.empty()) {
+                // User-supplied type via %define api.location.type {T}.
+                // Bison's convention: YYLTYPE becomes a typedef for T.
+                // The user is responsible for declaring T in a %code requires
+                // block (or earlier in the prologue) so it's visible here.
+                out << "typedef " << g_.api_location_type << " YYLTYPE;\n";
+            } else {
+                out << "typedef struct YYLTYPE {\n";
+                out << "  int first_line; int first_column;\n";
+                out << "  int last_line;  int last_column;\n";
+                out << "} YYLTYPE;\n";
+                out << "# define YYLTYPE_IS_TRIVIAL 1\n";
+            }
             out << "# define YYLTYPE_IS_DECLARED 1\n";
             out << "#endif\n";
         }
