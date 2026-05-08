@@ -163,6 +163,10 @@ struct Grammar {
     string parse_error_mode = "simple";
     // %define api.pure / %pure-parser: false (default) | true | full
     string api_pure = "false";
+    // %define api.token.raw: when true, token enum values equal internal
+    // indices and YYTRANSLATE is the identity, removing the need for the
+    // external-to-internal yytranslate[] lookup.
+    bool api_token_raw = false;
     // %parse-param {type name} ... — appended to yyparse signature
     // %lex-param   {type name} ... — passed to yylex calls (pure parsers)
     // Stored as raw "type name" strings, one per brace block.
@@ -809,6 +813,9 @@ private:
             else if (name == "parse.trace") {
                 g_.parse_trace = (v == "true" || v == "1" || v == "on");
             }
+            else if (name == "api.token.raw") {
+                g_.api_token_raw = (v == "true" || v == "1");
+            }
             advance();
         } else if (at(Tok::BraceBlock)) {
             // Braced value: keep raw braces for api.value.type but strip
@@ -830,6 +837,7 @@ private:
             // %define NAME (no value) — treat as "true".
             if (name == "api.pure") g_.api_pure = "true";
             else if (name == "parse.trace") g_.parse_trace = true;
+            else if (name == "api.token.raw") g_.api_token_raw = true;
         }
     }
 
@@ -1822,14 +1830,22 @@ private:
         return r;
     }
 
+    // Code reported in the token enum / #define for terminal s.
+    int emit_code_for(int s) const {
+        // With api.token.raw, the token "code" returned by the lexer is the
+        // internal symbol index (matches yytable / yycheck columns directly).
+        if (g_.api_token_raw) return l_.sym_to_internal(s);
+        return g_.syms[s].code;
+    }
+
     void emit_token_kinds(Buf out) {
         const string& tp = g_.token_prefix;
         out << "#ifndef YYTOKENTYPE\n# define YYTOKENTYPE\n";
         out << "  enum yytokentype {\n";
         out << "    YYEMPTY = -2,\n";
-        out << "    YYEOF = 0,\n";
-        out << "    YYerror = 256,\n";
-        out << "    YYUNDEF = 257";
+        out << "    YYEOF = " << (g_.api_token_raw ? l_.eof_internal() : 0) << ",\n";
+        out << "    YYerror = " << (g_.api_token_raw ? l_.error_internal() : 256) << ",\n";
+        out << "    YYUNDEF = " << (g_.api_token_raw ? l_.undef_internal() : 257);
         for (int s = 0; s < (int)g_.syms.size(); s++) {
             const Symbol& sm = g_.syms[s];
             if (!sm.is_terminal) continue;
@@ -1837,7 +1853,7 @@ private:
             if (sm.alias_of >= 0) continue;
             if (sm.name.empty()) continue;
             if (sm.name[0] == '\'' || sm.name[0] == '"' || sm.name[0] == '$') continue;
-            out << ",\n    " << tp << sm.name << " = " << sm.code;
+            out << ",\n    " << tp << sm.name << " = " << emit_code_for(s);
         }
         out << "\n  };\n";
         out << "  typedef enum yytokentype yytoken_kind_t;\n";
@@ -1850,7 +1866,7 @@ private:
             if (sm.name.empty()) continue;
             if (sm.name[0] == '\'' || sm.name[0] == '"' || sm.name[0] == '$') continue;
             out << "#ifndef " << tp << sm.name << "\n# define " << tp << sm.name
-                << " " << sm.code << "\n#endif\n";
+                << " " << emit_code_for(s) << "\n#endif\n";
         }
     }
 
@@ -2363,7 +2379,13 @@ private:
         if (P && L) out << "YYLTYPE *yyllocp, ";
         for (auto& p : g_.parse_params) out << p << ", ";
         out << "const char *msg);\n";
-        out << "#define YYTRANSLATE(c) ((0 <= (c) && (c) <= YYMAXUTOK) ? yytranslate[c] : 257)\n";
+        if (g_.api_token_raw) {
+            // The lexer returns internal indices directly; no translation.
+            out << "#define YYTRANSLATE(c) (c)\n";
+        } else {
+            out << "#define YYTRANSLATE(c) ((0 <= (c) && (c) <= YYMAXUTOK) ? yytranslate[c] : "
+                << l_.undef_internal() << ")\n";
+        }
         if (L) {
             out << "#ifndef YYLLOC_DEFAULT\n";
             out << "# define YYLLOC_DEFAULT(Cur, Rhs, N)                              \\\n";
