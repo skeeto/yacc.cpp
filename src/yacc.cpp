@@ -174,6 +174,11 @@ struct Grammar {
     // indices and YYTRANSLATE is the identity, removing the need for the
     // external-to-internal yytranslate[] lookup.
     bool api_token_raw = false;
+    // %define api.push-pull: pull (default) | push | both
+    // - pull: only yyparse() is generated (calls yylex internally).
+    // - push: only yypstate_new/yypush_parse/yypstate_delete are generated.
+    // - both: both APIs are generated (yyparse() runs an internal pull loop).
+    string api_push_pull = "pull";
     // %parse-param {type name} ... — appended to yyparse signature
     // %lex-param   {type name} ... — passed to yylex calls (pure parsers)
     // Stored as raw "type name" strings, one per brace block.
@@ -832,6 +837,7 @@ private:
             else if (name == "api.token.raw") {
                 g_.api_token_raw = (v == "true" || v == "1");
             }
+            else if (name == "api.push-pull") g_.api_push_pull = v;
             else if (name == "api.location.type") g_.api_location_type = v;
             advance();
         } else if (at(Tok::BraceBlock)) {
@@ -850,6 +856,7 @@ private:
             else if (name == "api.prefix") g_.api_prefix = body;
             else if (name == "api.token.prefix") g_.token_prefix = body;
             else if (name == "api.location.type") g_.api_location_type = body;
+            else if (name == "api.push-pull") g_.api_push_pull = body;
             advance();
         } else {
             // %define NAME (no value) — treat as "true".
@@ -1769,7 +1776,21 @@ public:
                 *hdr << "extern YYSTYPE yylval;\n";
                 if (g_.want_locations) *hdr << "extern YYLTYPE yylloc;\n";
             }
-            *hdr << "int yyparse(" << params_decl_signature() << ");\n";
+            const bool h_push_only = (g_.api_push_pull == "push");
+            const bool h_push_both = (g_.api_push_pull == "both");
+            if (!h_push_only) {
+                *hdr << "int yyparse(" << params_decl_signature() << ");\n";
+            }
+            if (h_push_only || h_push_both) {
+                *hdr << "#ifndef YYPUSH_MORE\n# define YYPUSH_MORE 4\n#endif\n";
+                *hdr << "typedef struct yypstate yypstate;\n";
+                *hdr << "yypstate *yypstate_new(void);\n";
+                *hdr << "void yypstate_delete(yypstate *);\n";
+                *hdr << "int yypush_parse(yypstate *, int, YYSTYPE const *";
+                if (g_.want_locations) *hdr << ", YYLTYPE const *";
+                for (auto& p : g_.parse_params) *hdr << ", " << p;
+                *hdr << ");\n";
+            }
             if (g_.parse_error_mode == "custom") {
                 // Forward-declare the public custom-parse-error API so
                 // user code (driver.c) can implement yyreport_syntax_error.
@@ -1817,9 +1838,20 @@ public:
         emit_destructor(out);
         emit_printer(out);
         emit_trace_macros(out);
-        emit_driver(out);
-        emit_action_switch(out);
-        emit_driver_tail(out);
+        // Push-only mode replaces yyparse() with yypstate_new /
+        // yypush_parse / yypstate_delete.  Both-mode keeps yyparse and
+        // adds the push API on top.
+        const bool push_only = (g_.api_push_pull == "push");
+        const bool push_both = (g_.api_push_pull == "both");
+        if (!push_only) {
+            emit_driver(out);
+            emit_action_switch(out);
+            emit_driver_tail(out);
+        }
+        if (push_only || push_both) {
+            emit_push_driver(out);
+            // emit_push_driver inlines its own switch and tail.
+        }
 
         if (!g_.epilogue.empty()) {
             if (!opts_.no_lines) out << "\n#line " << /*approx*/ 1 << " \"" << g_.source_file << "\"\n";
@@ -2000,6 +2032,14 @@ private:
         out << "#define yyerrok (yyerrstatus = 0)\n";
         out << "#define yyclearin (yychar = -2)\n";
         out << "#define YYFINAL " << l_.final_state() << "\n";
+        // YYTRANSLATE — always emitted so push-only mode (which skips
+        // emit_driver) still has it available.
+        if (g_.api_token_raw) {
+            out << "#define YYTRANSLATE(c) (c)\n";
+        } else {
+            out << "#define YYTRANSLATE(c) ((0 <= (c) && (c) <= YYMAXUTOK) ? yytranslate[c] : "
+                << l_.undef_internal() << ")\n";
+        }
         // YYBACKUP: push a token back onto the lookahead position.
         // Constraints (from Bison): action must be at end of rule and there
         // must be no current lookahead (yychar == YYEMPTY).  Violating either
@@ -2470,13 +2510,7 @@ private:
         if (P && L) out << "YYLTYPE *yyllocp, ";
         for (auto& p : g_.parse_params) out << p << ", ";
         out << "const char *msg);\n";
-        if (g_.api_token_raw) {
-            // The lexer returns internal indices directly; no translation.
-            out << "#define YYTRANSLATE(c) (c)\n";
-        } else {
-            out << "#define YYTRANSLATE(c) ((0 <= (c) && (c) <= YYMAXUTOK) ? yytranslate[c] : "
-                << l_.undef_internal() << ")\n";
-        }
+        // YYTRANSLATE was emitted by emit_constants above.
         if (L) {
             out << "#ifndef YYLLOC_DEFAULT\n";
             out << "# define YYLLOC_DEFAULT(Cur, Rhs, N)                              \\\n";
@@ -2871,6 +2905,295 @@ private:
         out << "    if (yyss != yyssa) { free(yyss); free(yyvs);" << (L ? " free(yyls);" : "") << " }\n";
         out << "    return yyresult;\n";
         out << "}\n";
+    }
+
+    // Push-parser API: yypstate, yypstate_new, yypush_parse, yypstate_delete.
+    // Implements the same state machine as the pull driver above, but the
+    // entire state lives in a heap-allocated yypstate so that yypush_parse
+    // can return YYPUSH_MORE when it needs another token, and resume on the
+    // next call.  When api.push-pull=both, this lives alongside yyparse;
+    // when push-only, this replaces it.
+    void emit_push_driver(Buf out) {
+        const bool L = g_.want_locations;
+        const bool push_both = (g_.api_push_pull == "both");
+        out << "#define YYPUSH_MORE 4\n";
+        out << "typedef struct yypstate yypstate;\n";
+        out << "struct yypstate {\n";
+        out << "    int yynew;\n";
+        out << "    int yystate;\n";
+        out << "    int yyerrstatus;\n";
+        out << "    int yystacksize;\n";
+        out << "    short *yyss;\n";
+        out << "    YYSTYPE *yyvs;\n";
+        if (L) out << "    YYLTYPE *yyls;\n";
+        out << "    short yyssa[YYINITDEPTH];\n";
+        out << "    YYSTYPE yyvsa[YYINITDEPTH];\n";
+        if (L) out << "    YYLTYPE yylsa[YYINITDEPTH];\n";
+        out << "    short *yyssp;\n";
+        out << "    YYSTYPE *yyvsp;\n";
+        if (L) out << "    YYLTYPE *yylsp;\n";
+        out << "    int yychar;\n";
+        out << "    YYSTYPE yylval;\n";
+        if (L) out << "    YYLTYPE yylloc;\n";
+        out << "    int yynerrs;\n";
+        out << "};\n";
+
+        // Constructor.
+        out << "yypstate *yypstate_new(void) {\n";
+        out << "    yypstate *yyps = (yypstate*)malloc(sizeof(*yyps));\n";
+        out << "    if (!yyps) return NULL;\n";
+        out << "    yyps->yynew = 1;\n";
+        out << "    yyps->yychar = -2;\n";
+        out << "    yyps->yyss = NULL;\n";
+        out << "    yyps->yyvs = NULL;\n";
+        if (L) out << "    yyps->yyls = NULL;\n";
+        out << "    return yyps;\n";
+        out << "}\n";
+
+        // Destructor.
+        out << "void yypstate_delete(yypstate *yyps) {\n";
+        out << "    if (!yyps) return;\n";
+        out << "    if (yyps->yyss && yyps->yyss != yyps->yyssa) {\n";
+        out << "        free(yyps->yyss); free(yyps->yyvs);";
+        if (L) out << " free(yyps->yyls);";
+        out << "\n    }\n";
+        out << "    free(yyps);\n";
+        out << "}\n";
+
+        // The push-parse function.
+        out << "int yypush_parse(yypstate *yyps, int yypushed_char, "
+               "YYSTYPE const *yypushed_val";
+        if (L) out << ", YYLTYPE const *yypushed_loc";
+        for (auto& p : g_.parse_params) out << ", " << p;
+        out << ") {\n";
+
+        // Same locals as pull but synced into yyps. Using ps->* directly
+        // throughout keeps state across calls.
+        out << "    int yyn;\n";
+        out << "    int yyresult;\n";
+        out << "    int yytoken = -2;\n";
+        out << "    YYSTYPE yyval;\n";
+        if (L) out << "    YYLTYPE yyloc;\n";
+        out << "    int yylen = 0;\n";
+        out << "\n";
+        out << "    if (yyps->yynew) {\n";
+        out << "        yyps->yynew = 0;\n";
+        out << "        yyps->yystate = 0;\n";
+        out << "        yyps->yyerrstatus = 0;\n";
+        out << "        yyps->yystacksize = YYINITDEPTH;\n";
+        out << "        yyps->yyss = yyps->yyssa;\n";
+        out << "        yyps->yyvs = yyps->yyvsa;\n";
+        if (L) out << "        yyps->yyls = yyps->yylsa;\n";
+        out << "        yyps->yyssp = yyps->yyss;\n";
+        out << "        yyps->yyvsp = yyps->yyvs;\n";
+        if (L) out << "        yyps->yylsp = yyps->yyls;\n";
+        out << "        *yyps->yyssp = 0;\n";
+        out << "        yyps->yychar = -2;\n";
+        out << "        yyps->yynerrs = 0;\n";
+        // After init, also accept the caller's first token.  Bison treats
+        // the first yypush_parse call as an init+feed: the first token
+        // must arrive in time to be matched after the start-state reduces.
+        out << "        yyps->yychar = yypushed_char;\n";
+        out << "        if (yypushed_val) yyps->yylval = *yypushed_val;\n";
+        if (L) out << "        if (yypushed_loc) yyps->yylloc = *yypushed_loc;\n";
+        out << "        goto yysetstate;\n";
+        out << "    }\n";
+        // Resume: caller has provided a token.
+        out << "    yyps->yychar = yypushed_char;\n";
+        out << "    if (yypushed_val) yyps->yylval = *yypushed_val;\n";
+        if (L) out << "    if (yypushed_loc) yyps->yylloc = *yypushed_loc;\n";
+        out << "    goto yybackup;\n";
+        out << "\n";
+
+        // The body: same logic as pull driver, but using yyps->* and
+        // returning YYPUSH_MORE when a token is needed.
+        out << "yynewstate:\n";
+        out << "    yyps->yyssp++;\n";
+        out << "yysetstate:\n";
+        out << "    *yyps->yyssp = (short)yyps->yystate;\n";
+        out << "    if (yyps->yyss + yyps->yystacksize - 1 <= yyps->yyssp) {\n";
+        out << "        long yysize = yyps->yyssp - yyps->yyss + 1;\n";
+        out << "        if (yyps->yystacksize >= YYMAXDEPTH) goto yyexhaustedlab;\n";
+        out << "        yyps->yystacksize *= 2;\n";
+        out << "        if (yyps->yystacksize > YYMAXDEPTH) yyps->yystacksize = YYMAXDEPTH;\n";
+        out << "        short *new_ss = (short*)malloc((size_t)yyps->yystacksize * sizeof(short));\n";
+        out << "        YYSTYPE *new_vs = (YYSTYPE*)malloc((size_t)yyps->yystacksize * sizeof(YYSTYPE));\n";
+        if (L) out << "        YYLTYPE *new_ls = (YYLTYPE*)malloc((size_t)yyps->yystacksize * sizeof(YYLTYPE));\n";
+        out << "        if (!new_ss || !new_vs" << (L ? " || !new_ls" : "")
+            << ") { free(new_ss); free(new_vs);" << (L ? " free(new_ls);" : "") << " goto yyexhaustedlab; }\n";
+        out << "        memcpy(new_ss, yyps->yyss, (size_t)yysize * sizeof(short));\n";
+        out << "        memcpy(new_vs, yyps->yyvs, (size_t)yysize * sizeof(YYSTYPE));\n";
+        if (L) out << "        memcpy(new_ls, yyps->yyls, (size_t)yysize * sizeof(YYLTYPE));\n";
+        out << "        if (yyps->yyss != yyps->yyssa) { free(yyps->yyss); free(yyps->yyvs);";
+        if (L) out << " free(yyps->yyls);";
+        out << " }\n";
+        out << "        yyps->yyss = new_ss; yyps->yyvs = new_vs;";
+        if (L) out << " yyps->yyls = new_ls;";
+        out << "\n";
+        out << "        yyps->yyssp = yyps->yyss + yysize - 1;\n";
+        out << "        yyps->yyvsp = yyps->yyvs + yysize - 1;\n";
+        if (L) out << "        yyps->yylsp = yyps->yyls + yysize - 1;\n";
+        out << "    }\n";
+        out << "    if (yyps->yystate == YYFINAL) goto yyacceptlab;\n";
+        out << "\n";
+        out << "yybackup:\n";
+        out << "    yyn = yypact[yyps->yystate];\n";
+        out << "    if (yypact_value_is_default(yyn)) goto yydefault;\n";
+        // The push pause point.
+        out << "    if (yyps->yychar == -2) return YYPUSH_MORE;\n";
+        out << "    if (yyps->yychar <= 0) { yyps->yychar = 0; yytoken = 0; }\n";
+        out << "    else if (yyps->yychar == 256) { yyps->yychar = 257; yytoken = YYTRANSLATE(257); goto yyerrlab1; }\n";
+        out << "    else yytoken = YYTRANSLATE(yyps->yychar);\n";
+        out << "    yyn += yytoken;\n";
+        out << "    if (yyn < 0 || yyn >= (int)YYTABLE_SIZE || yycheck[yyn] != yytoken) goto yydefault;\n";
+        out << "    yyn = yytable[yyn];\n";
+        out << "    if (yyn <= 0) {\n";
+        out << "        if (yytable_value_is_error(yyn)) goto yyerrlab;\n";
+        out << "        if (yyn == 0) goto yyacceptlab;\n";
+        out << "        yyn = -yyn;\n";
+        out << "        goto yyreduce;\n";
+        out << "    }\n";
+        out << "    if (yyps->yyerrstatus) yyps->yyerrstatus--;\n";
+        out << "    yyps->yystate = yyn;\n";
+        out << "    *++yyps->yyvsp = yyps->yylval;\n";
+        if (L) out << "    *++yyps->yylsp = yyps->yylloc;\n";
+        out << "    yyps->yychar = -2;\n";
+        out << "    goto yynewstate;\n";
+        out << "\n";
+        out << "yydefault:\n";
+        out << "    yyn = yydefact[yyps->yystate];\n";
+        out << "    if (yyn == 0) goto yyerrlab;\n";
+        out << "    goto yyreduce;\n";
+        out << "\n";
+        out << "yyreduce:\n";
+        out << "    yylen = yyr2[yyn];\n";
+        out << "    if (yylen) yyval = yyps->yyvsp[1 - yylen];\n";
+        out << "    else memset(&yyval, 0, sizeof(yyval));\n";
+        if (L) out << "    YYLLOC_DEFAULT(yyloc, (yyps->yylsp - yylen), yylen);\n";
+        // Action switch.  Inside actions, $$/$N reference yyval/yyvsp[*]
+        // — we need yyvsp to point into ps->yyvsp.  Use macro shim.
+        out << "#define yyvsp (yyps->yyvsp)\n";
+        if (L) out << "#define yylsp (yyps->yylsp)\n";
+        out << "    switch (yyn) {\n";
+        for (int i = 1; i < l_.n_rules(); i++) {
+            const Production& p = l_.prod(i);
+            if (p.action.empty()) continue;
+            out << "    case " << i << ":\n";
+            out << "      { " << translate_action(p) << " }\n";
+            out << "      break;\n";
+        }
+        out << "    }\n";
+        out << "#undef yyvsp\n";
+        if (L) out << "#undef yylsp\n";
+        out << "    yyps->yyssp -= yylen;\n";
+        out << "    yyps->yyvsp -= yylen;\n";
+        if (L) out << "    yyps->yylsp -= yylen;\n";
+        out << "    yylen = 0;\n";
+        out << "    *++yyps->yyvsp = yyval;\n";
+        if (L) out << "    *++yyps->yylsp = yyloc;\n";
+        out << "    {\n";
+        out << "        int yylhs_internal = yyr1[yyn];\n";
+        out << "        int nt = yylhs_internal - YYNTOKENS;\n";
+        out << "        int gpos = yypgoto[nt] + *yyps->yyssp;\n";
+        out << "        if (gpos >= 0 && gpos < (int)YYTABLE_SIZE && yycheck[gpos] == *yyps->yyssp)\n";
+        out << "            yyps->yystate = yytable[gpos];\n";
+        out << "        else\n";
+        out << "            yyps->yystate = yydefgoto[nt];\n";
+        out << "    }\n";
+        out << "    goto yynewstate;\n";
+        out << "\n";
+        out << "yyerrlab:\n";
+        const bool verbose = (g_.parse_error_mode == "verbose" ||
+                              g_.parse_error_mode == "detailed");
+        if (verbose) {
+            out << "    if (!yyps->yyerrstatus) { ++yyps->yynerrs; "
+                << "yysyntax_error(yyps->yystate, yytoken";
+            if (pure() && L) out << ", &yyps->yylloc";
+            for (auto& p : g_.parse_params) {
+                size_t end = p.find_last_not_of(" \t\r\n");
+                if (end == string::npos) continue;
+                size_t start = end;
+                while (start > 0 && (ch_isalnum((unsigned char)p[start - 1]) || p[start - 1] == '_'))
+                    start--;
+                out << ", " << p.substr(start, end - start + 1);
+            }
+            out << "); }\n";
+        } else {
+            out << "    if (!yyps->yyerrstatus) { ++yyps->yynerrs; yyerror(";
+            if (pure() && L) out << "&yyps->yylloc, ";
+            for (auto& p : g_.parse_params) {
+                size_t end = p.find_last_not_of(" \t\r\n");
+                if (end == string::npos) continue;
+                size_t start = end;
+                while (start > 0 && (ch_isalnum((unsigned char)p[start - 1]) || p[start - 1] == '_'))
+                    start--;
+                out << p.substr(start, end - start + 1) << ", ";
+            }
+            out << "\"syntax error\"); }\n";
+        }
+        out << "    if (yyps->yyerrstatus == 3) {\n";
+        out << "        if (yyps->yychar <= 0) goto yyabortlab;\n";
+        out << "        yyps->yychar = -2;\n";
+        out << "    }\n";
+        out << "yyerrlab1:\n";
+        out << "    yyps->yyerrstatus = 3;\n";
+        out << "    for (;;) {\n";
+        out << "        yyn = yypact[yyps->yystate];\n";
+        out << "        if (!yypact_value_is_default(yyn)) {\n";
+        out << "            int err_internal = " << l_.error_internal() << ";\n";
+        out << "            int idx = yyn + err_internal;\n";
+        out << "            if (idx >= 0 && idx < (int)YYTABLE_SIZE && yycheck[idx] == err_internal) {\n";
+        out << "                yyn = yytable[idx];\n";
+        out << "                if (yyn > 0) {\n";
+        out << "                    yyps->yystate = yyn;\n";
+        out << "                    *++yyps->yyvsp = yyps->yylval;\n";
+        if (L) out << "                    *++yyps->yylsp = yyps->yylloc;\n";
+        out << "                    goto yynewstate;\n";
+        out << "                }\n";
+        out << "            }\n";
+        out << "        }\n";
+        out << "        if (yyps->yyssp == yyps->yyss) goto yyabortlab;\n";
+        out << "        yyps->yyvsp--;\n";
+        if (L) out << "        yyps->yylsp--;\n";
+        out << "        yyps->yystate = *--yyps->yyssp;\n";
+        out << "    }\n";
+        out << "\n";
+        out << "yyacceptlab:\n";
+        out << "    yyresult = 0; goto yyreturn;\n";
+        out << "yyabortlab:\n";
+        out << "    yyresult = 1; goto yyreturn;\n";
+        out << "yyexhaustedlab:\n";
+        out << "    yyresult = 2; goto yyreturn;\n";
+        out << "yyreturn:\n";
+        out << "    yyps->yynew = 1;  /* allow re-init for fresh parse */\n";
+        out << "    return yyresult;\n";
+        out << "}\n";
+
+        // For "both" mode, also emit yyparse() that wraps yypstate/yypush_parse.
+        if (push_both) {
+            out << "int yyparse(" << params_decl_signature() << ") {\n";
+            out << "    yypstate *ps = yypstate_new();\n";
+            out << "    if (!ps) return 2;\n";
+            out << "    int rc;\n";
+            out << "    do {\n";
+            out << "        int tok = yylex(" << yylex_call_args() << ");\n";
+            out << "        rc = yypush_parse(ps, tok, ";
+            out << (pure() ? "&yylval" : "&yylval");
+            if (L) out << ", &yylloc";
+            for (auto& p : g_.parse_params) {
+                size_t end = p.find_last_not_of(" \t\r\n");
+                if (end == string::npos) continue;
+                size_t start = end;
+                while (start > 0 && (ch_isalnum((unsigned char)p[start - 1]) || p[start - 1] == '_'))
+                    start--;
+                out << ", " << p.substr(start, end - start + 1);
+            }
+            out << ");\n";
+            out << "    } while (rc == YYPUSH_MORE);\n";
+            out << "    yypstate_delete(ps);\n";
+            out << "    return rc;\n";
+            out << "}\n";
+        }
     }
 };
 
