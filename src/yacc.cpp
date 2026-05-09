@@ -3072,8 +3072,9 @@ private:
 
     void emit_cxx_class_header(Buf out) {
         // Emit token enum with bison's nested-struct shape:
-        //   parser::token::yytokentype
-        // The "TOK_" prefix on YYEOF/YYerror/YYUNDEF mirrors bison.
+        //   parser::token::yytokentype          (external token codes)
+        //   parser::symbol_kind::kind_type      (internal numbering used
+        //                                        by yytname / yytable etc.)
         out << "        struct token {\n";
         out << "            enum yytokentype {\n";
         out << "                YYEMPTY = -2,\n";
@@ -3095,24 +3096,77 @@ private:
         out << "            typedef yytokentype yytoken_kind_t;\n";
         out << "        };\n";
         out << "        typedef token::yytoken_kind_t token_kind_type;\n";
+
+        // symbol_kind: internal numbering (terminals first, then nonterminals,
+        // both contiguous from 0).  Mirrors bison's lalr1.cc API so user code
+        // that walks symbol_kind values is portable.
+        out << "        struct symbol_kind {\n";
+        out << "            enum kind_type {\n";
+        out << "                S_YYEMPTY = -2,\n";
+        for (int i = 0; i < l_.n_total_syms(); i++) {
+            int sym = l_.internal_to_sym(i);
+            std::string label;
+            if (sym == g_.eof_sym) label = "S_YYEOF";
+            else if (sym == g_.error_sym) label = "S_YYerror";
+            else if (sym == g_.undef_sym) label = "S_YYUNDEF";
+            else {
+                const auto& s = g_.syms[sym];
+                if (!s.name.empty() && s.name[0] == '\'') {
+                    // single-char terminal (e.g. '+').  Use its byte value
+                    // plus a letter suffix when it's alpha-num so the C++
+                    // identifier reads "S_43_PLUS" not "S_43_+".
+                    unsigned char ch = (unsigned char)s.name[1];
+                    label = "S_" + std::to_string((int)ch);
+                    if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                        (ch >= '0' && ch <= '9'))
+                        label += std::string("_") + (char)ch;
+                } else if (!s.name.empty() && s.name[0] == '"') {
+                    // string-alias terminal -- use a sequence number.
+                    label = "S_str_" + std::to_string(i);
+                } else {
+                    // Mangle any non-identifier characters in the symbol
+                    // name (rare -- midrule synthetics are "$@N").
+                    label = "S_";
+                    for (char c : s.name) {
+                        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                            (c >= '0' && c <= '9') || c == '_')
+                            label.push_back(c);
+                        else
+                            label.push_back('_');
+                    }
+                }
+            }
+            out << "                " << label << " = " << i << ",\n";
+        }
+        out << "            };\n";
+        out << "        };\n";
+        out << "        typedef symbol_kind::kind_type symbol_kind_type;\n";
     }
 
     // position/location classes for the C++ skeleton when %locations is on.
-    // Bison's lalr1.cc emits a richer pair (with stream operators, advance
-    // helpers, etc.); for Stage 2 we emit the minimum interface that
-    // grammars commonly use: begin/end positions with line/column, and a
-    // step() helper that collapses a location to a point.
+    // Members commonly accessed in real grammars: begin/end positions with
+    // line/column/filename, a step() helper that collapses to a point, and
+    // ostream operator<< for diagnostics (printing location_type into
+    // error messages is the obvious idiom).
     void emit_cxx_location_classes(Buf hdr) {
         // Skip emit if user supplied a custom location type.
         if (!g_.api_location_type.empty()) return;
         hdr << "    class position {\n";
         hdr << "    public:\n";
-        hdr << "        position(int l = 1, int c = 1) : line(l), column(c) {}\n";
+        hdr << "        position(const std::string* f = nullptr, int l = 1, int c = 1)\n";
+        hdr << "            : filename(f), line(l), column(c) {}\n";
+        hdr << "        const std::string* filename;\n";
         hdr << "        int line;\n";
         hdr << "        int column;\n";
-        hdr << "        void lines(int count = 1) { if (count) { line += count; column = 1; } }\n";
+        hdr << "        void lines(int count = 1) {\n";
+        hdr << "            if (count) { line += count; column = 1; }\n";
+        hdr << "        }\n";
         hdr << "        void columns(int count = 1) { column += count; }\n";
         hdr << "    };\n";
+        hdr << "    inline std::ostream& operator<<(std::ostream& o, const position& p) {\n";
+        hdr << "        if (p.filename) o << *p.filename << ':';\n";
+        hdr << "        return o << p.line << '.' << p.column;\n";
+        hdr << "    }\n";
         hdr << "    class location {\n";
         hdr << "    public:\n";
         hdr << "        location() = default;\n";
@@ -3123,6 +3177,14 @@ private:
         hdr << "        void lines(int count = 1) { end.lines(count); }\n";
         hdr << "        void columns(int count = 1) { end.columns(count); }\n";
         hdr << "    };\n";
+        hdr << "    inline std::ostream& operator<<(std::ostream& o, const location& loc) {\n";
+        hdr << "        o << loc.begin;\n";
+        hdr << "        if (loc.begin.line   != loc.end.line)\n";
+        hdr << "            o << '-' << loc.end.line << '.' << (loc.end.column - 1);\n";
+        hdr << "        else if (loc.begin.column != loc.end.column - 1)\n";
+        hdr << "            o << '-' << (loc.end.column - 1);\n";
+        hdr << "        return o;\n";
+        hdr << "    }\n";
     }
 
     void emit_cxx_header(Buf hdr) {
@@ -3133,6 +3195,7 @@ private:
         hdr << "#ifndef " << guard << "\n";
         hdr << "#define " << guard << "\n\n";
         hdr << "#include <string>\n";
+        if (g_.want_locations) hdr << "#include <ostream>\n";
         if (g_.api_value_type == "variant") hdr << "#include <variant>\n";
         hdr << "\n";
 
@@ -3235,6 +3298,11 @@ private:
         } else {
             hdr << "        virtual void error(const std::string& msg);\n";
         }
+        // Static name lookup: maps a symbol-kind value to its display
+        // name.  Same API shape as bison's lalr1.cc.  Pass either a
+        // symbol_kind_type (S_NUM, S_program, ...) directly or convert
+        // a token kind via this->kind_for(token).
+        hdr << "        static const char* symbol_name(symbol_kind_type kind);\n";
         hdr << "    };\n";
         hdr << "}\n\n";
 
@@ -3364,6 +3432,16 @@ private:
         out << "namespace " << g_.api_namespace << " {\n";
         out << g_.api_parser_class << "::" << g_.api_parser_class << "() {}\n";
         out << g_.api_parser_class << "::~" << g_.api_parser_class << "() {}\n";
+        // symbol_name: take an internal symbol_kind value, return the
+        // corresponding yytname entry.
+        out << "const char* " << g_.api_parser_class
+            << "::symbol_name(symbol_kind_type kind) {\n";
+        out << "    int idx = (int)kind;\n";
+        out << "    if (idx == -2) return \"end of file\";\n";
+        out << "    if (idx >= 0 && idx < (int)(sizeof(yytname)/sizeof(yytname[0])))\n";
+        out << "        return yytname[idx];\n";
+        out << "    return \"$undefined\";\n";
+        out << "}\n";
         // error() is declared in the header but NOT defined here -- the
         // user must override.  Same contract as bison's lalr1.cc.
 
