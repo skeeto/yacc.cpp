@@ -49,30 +49,6 @@ the optimization to land for users with very large grammars.
 
 ## Medium items
 
-### Better table packer (PG-class grammars)
-
-Current packer is first-fit with a forbidden-base hash + identical-row
-deduplication.  PostgreSQL's `gram.y` (~5000 states, ~500 terminals)
-processes in ~45s with a yytable 2.2x bigger than bison's; bison takes
-~2.5s.  The hot loop is `base++` searching for a base where every
-entry lands on an unclaimed cell — at high row counts most attempts
-fail the entries-free check.
-
-Two optimizations bison uses that we don't:
-
-- **Bitmap-accelerated occupancy check.** Maintain a parallel bitmap
-  of claimed cells; the entries-free probe becomes one bitwise OR /
-  AND per machine word rather than per-entry indirect access.
-- **Smarter row ordering.**  Bison sorts rows so that the densest /
-  widest-spanning rows pin down the structure first, then packs sparse
-  rows into the gaps.  Our `entries.size() desc` sort approximates
-  this but doesn't account for column spread.
-
-Reading `bison-3.8.2/src/tables.c` (`pack_table`, `pack_vector`) is
-the right starting point — the algorithm is documented in-source.
-A 5-10x speed-up plus a further 30-50% table-size reduction on PG
-seems realistic.
-
 ### Counterexample generation: full Isradisaikul/Myers algorithm
 
 Counterexamples (`-Wcounterexamples` / `-Wcex`) report the state, the
