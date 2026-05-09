@@ -31,6 +31,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -724,6 +725,8 @@ private:
             case Tok::PercentLocations: advance(); g_.want_locations = true; return;
             case Tok::PercentNamePrefix:
                 advance();
+                // Old-style PostgreSQL form: %name-prefix="base_yy"
+                if (at(Tok::Punct) && peek_.text == "=") advance();
                 if (at(Tok::StrLit)) { g_.api_prefix = peek_.text; advance(); }
                 return;
             case Tok::PercentRequire:
@@ -984,6 +987,8 @@ private:
         string tag;
         if (at(Tok::Tag)) { tag = peek_.text; advance(); seen_typed_decl_ = true; }
         while (true) {
+            // Allow tag re-binding mid-list (matches Perl-style usage).
+            if (at(Tok::Tag)) { tag = peek_.text; advance(); seen_typed_decl_ = true; continue; }
             int idx = -1;
             if (at(Tok::Identifier)) {
                 idx = g_.find(peek_.text);
@@ -1012,6 +1017,10 @@ private:
         if (assoc != Assoc::None) prec_level = ++next_prec_;
         bool any = false;
         while (true) {
+            // Perl's perly.y switches tag mid-declaration:
+            //   %left <ival> OROP <pval> PLUGIN_LOGICAL_OR_LOW_OP
+            // Each <tag> applies to symbols that follow until the next.
+            if (at(Tok::Tag)) { tag = peek_.text; advance(); seen_typed_decl_ = true; continue; }
             int idx = -1;
             int explicit_code = -1;
             string alias_str;
@@ -1160,7 +1169,14 @@ private:
                     g_.prods.push_back(std::move(mp));
                     p.rhs.push_back(mr_idx);
                     p.rhs_tags.push_back("");
-                    p.rhs_names.push_back("");
+                    // Optional [name] after a mid-rule action binds the
+                    // mid-rule's $$ to a name (Perl's perly.y uses this).
+                    string mr_namedref;
+                    if (at(Tok::BracketName)) {
+                        mr_namedref = peek_.text;
+                        advance();
+                    }
+                    p.rhs_names.push_back(mr_namedref);
                 }
             } else break;
         }
@@ -2441,48 +2457,56 @@ private:
                 return a.entries.size() > b.entries.size();
             });
 
-        // Strict packing.
+        // Strict packing.  Speed-critical for big grammars (PostgreSQL has
+        // ~5000 states / ~500 terminals -- the naive O(rows * bases * domain)
+        // scan was minutes; replaced with O(1) forbidden-base lookup.
+        //
+        // Invariant: claim (idx, c) creates a false-positive when a future
+        // row R' at base b' probes col=c' with col' in [0, R'.domain) and
+        // b'+col' == idx, c' == c.  Solving: b' = idx - c, valid only when
+        // c < R'.domain.  Since b' = base of THIS row (idx-c == base for all
+        // entries placed by this row), each row contributes exactly its
+        // base to the forbidden set of any row whose domain covers some
+        // entry's c.
+        //
+        // Action rows have domain=nT, so col < nT always; goto rows have
+        // domain=nS (>= nT), col < nS.  The two checking-row types see
+        // different forbidden sets, so we track them separately:
+        //   forbidden_for_action_check: bases of rows that placed any
+        //     entry with c < nT.  (Action rows always contribute; goto
+        //     rows contribute iff they hit a small-state column.)
+        //   forbidden_for_goto_check:   bases of all placed rows.
+        std::unordered_set<int> forbidden_for_action;
+        std::unordered_set<int> forbidden_for_goto;
+        forbidden_for_action.reserve(rows.size());
+        forbidden_for_goto.reserve(rows.size());
         for (const Row& r : rows) {
             int min_col = r.entries.front().first;
             for (auto& e : r.entries) min_col = std::min(min_col, e.first);
             int base = -min_col;
+            const auto& my_forbidden = r.is_goto ? forbidden_for_goto
+                                                 : forbidden_for_action;
             for (;;) {
+                if (my_forbidden.count(base)) { base++; continue; }
+                // r's used cols must land on unclaimed cells.
                 bool ok = true;
-                // Check every column 0..domain-1 (not just r's columns):
-                //   claimed[base+col] must not equal col.
-                int last = base + r.domain - 1;
-                if (last >= (int)claimed.size()) {
-                    // Cells beyond claimed.size() are unclaimed by definition;
-                    // we only need to check up to claimed.size() - 1.
-                    last = (int)claimed.size() - 1;
-                }
-                for (int col = 0; col <= last - base && col < r.domain; col++) {
-                    int idx = base + col;
-                    if (idx < 0) { ok = false; break; }
-                    if (claimed[idx] == col) { ok = false; break; }
-                }
-                if (!ok) { base++; continue; }
-                // Also: r's used cols must be unclaimed (claimed == -1) at
-                // (base+col), so we can write our entry there.  The check
-                // above already covers col == claim_col, but other state's
-                // claim at idx with col' != col is fine.  However, we
-                // can't WRITE into a cell already used by another state
-                // (yytable cell holds another value).
                 for (auto& e : r.entries) {
                     int idx = base + e.first;
-                    if (idx >= 0 && idx < (int)claimed.size() && claimed[idx] != -1) {
-                        ok = false;
-                        break;
+                    if (idx < 0) { ok = false; break; }
+                    if (idx < (int)claimed.size() && claimed[idx] != -1) {
+                        ok = false; break;
                     }
                 }
                 if (ok) break;
                 base++;
             }
             // Place.
+            bool has_small_col = false;
             for (auto& e : r.entries) {
                 int idx = base + e.first;
                 reserve(idx);
                 claimed[idx] = e.first;
+                if (e.first < nT) has_small_col = true;
                 if (r.is_goto) {
                     yytable[idx] = e.second - 1;
                     yycheck[idx] = e.first;
@@ -2492,6 +2516,11 @@ private:
                     yycheck[idx] = e.first;
                 }
             }
+            // Update forbidden sets.  Goto-checkers see every prior base;
+            // action-checkers only see prior bases that placed at least
+            // one cell with col < nT.
+            forbidden_for_goto.insert(base);
+            if (has_small_col) forbidden_for_action.insert(base);
             if (r.is_goto) yypgoto[r.row_id] = base;
             else            yypact[r.row_id]  = base;
         }
