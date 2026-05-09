@@ -3289,7 +3289,15 @@ private:
         }
 
         hdr << "\n";
-        hdr << "        " << g_.api_parser_class << "();\n";
+        // Constructor: takes the same %parse-param list (if any) as
+        // bison's lalr1.cc, stored as members so parse() / actions can
+        // reference them via plain identifier names.
+        hdr << "        " << g_.api_parser_class << "(";
+        for (size_t i = 0; i < g_.parse_params.size(); i++) {
+            if (i) hdr << ", ";
+            hdr << g_.parse_params[i];
+        }
+        hdr << ");\n";
         hdr << "        virtual ~" << g_.api_parser_class << "();\n";
         hdr << "        virtual int parse();\n";
         if (g_.want_locations) {
@@ -3303,6 +3311,13 @@ private:
         // symbol_kind_type (S_NUM, S_program, ...) directly or convert
         // a token kind via this->kind_for(token).
         hdr << "        static const char* symbol_name(symbol_kind_type kind);\n";
+        // %parse-param fields: stored as members so action bodies can
+        // refer to them via their declared names.
+        if (!g_.parse_params.empty()) {
+            hdr << "    private:\n";
+            for (auto& p : g_.parse_params) hdr << "        " << p << ";\n";
+            hdr << "    public:\n";
+        }
         hdr << "    };\n";
         hdr << "}\n\n";
 
@@ -3430,7 +3445,35 @@ private:
 
         // Class implementation.
         out << "namespace " << g_.api_namespace << " {\n";
-        out << g_.api_parser_class << "::" << g_.api_parser_class << "() {}\n";
+        out << g_.api_parser_class << "::" << g_.api_parser_class << "(";
+        for (size_t i = 0; i < g_.parse_params.size(); i++) {
+            if (i) out << ", ";
+            out << g_.parse_params[i];
+        }
+        out << ")";
+        // Initializer list copies parse-params into matching members.
+        if (!g_.parse_params.empty()) {
+            out << "\n    : ";
+            std::string call = params_call(g_.parse_params);  // ", n1, n2, ..."
+            // Skip the leading ", " and split on ", ".
+            std::vector<std::string> names;
+            size_t pos = 0;
+            while (pos < call.size()) {
+                if (call[pos] == ',') { pos++; continue; }
+                if (call[pos] == ' ') { pos++; continue; }
+                size_t end = call.find(',', pos);
+                if (end == std::string::npos) end = call.size();
+                std::string nm = call.substr(pos, end - pos);
+                while (!nm.empty() && nm.back() == ' ') nm.pop_back();
+                if (!nm.empty()) names.push_back(nm);
+                pos = end;
+            }
+            for (size_t i = 0; i < names.size(); i++) {
+                if (i) out << ", ";
+                out << names[i] << "(" << names[i] << ")";
+            }
+        }
+        out << " {}\n";
         out << g_.api_parser_class << "::~" << g_.api_parser_class << "() {}\n";
         // symbol_name: take an internal symbol_kind value, return the
         // corresponding yytname entry.
