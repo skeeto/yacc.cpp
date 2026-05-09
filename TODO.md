@@ -5,24 +5,31 @@ implemented at all. Roughly grouped by effort.
 
 ## Large items
 
-### C++ output skeleton (`%language "c++"`, `%skeleton "lalr1.cc"`)
+### C++ skeleton remaining items
 
-The directives parse and the value is captured, but the emitter produces only
-C output. A full Bison-compatible `lalr1.cc` skeleton needs:
+The basic `%language "c++"` / `%skeleton "lalr1.cc"` path is in place,
+producing a `namespace yy { class parser { ... }; }` with `parse()`,
+virtual `error()`, token-kind enum, and `semantic_type` typedef.
+`%locations` plumbs `position`/`location` classes; `%define
+api.value.type variant` builds on `std::variant` with per-rule
+emplace; `%define api.value.automove` wraps `$N` in `std::move`;
+`%define api.token.constructor` adds `make_NAME` factories and a
+`symbol_type` returned by `yylex`.  `%define api.namespace` and
+`%define api.parser.class` configure the names.
 
-- A `parser` class in a configurable namespace (`%define api.namespace`).
-- `enum class symbol_kind` with member-function token-name lookup.
-- `int parse()` method, `error()` virtual hook, optional `report_syntax_error`.
-- `value_type` typedef plus support for `%define api.value.type variant` (a
-  small tagged-union with proper constructors / destructors / move semantics).
-- `%define api.token.constructor` and `api.value.automove`.
-- `parser::location` and `parser::position` classes when `%locations` is on,
-  configurable via `%define api.location.type`.
-- A separate skeleton interface so the C and C++ paths can coexist.
+Still missing for full Bison-compat:
 
-Scale: at minimum +500 lines for the skeleton alone, more for the value-type
-machinery. Test infrastructure (`tests/runner/run_case.cmake.in`) needs a
-`driver.cc` codepath with `g++` instead of `cc`.
+- `enum class symbol_kind` with member-function token-name lookup
+  (currently we expose `token::yytokentype` only).
+- `report_syntax_error` virtual hook (`%define parse.error custom`
+  for the C++ path).
+- C++ push parser support (`%define api.push-pull push|both`).
+- C++ GLR (`%glr-parser` interaction with `%language "c++"`).
+- Stack growth + destructors in the C++ state machine (currently a
+  fixed YYINITDEPTH stack with `error("memory exhausted")` on
+  overflow).
+- More elaborate `position`/`location` API (stream operators,
+  `position::filename`, line-number arithmetic).
 
 ### GLR: full Tomita GSS
 
