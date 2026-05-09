@@ -3182,6 +3182,49 @@ private:
 
         emit_cxx_class_header(hdr);
 
+        // symbol_type + make_NAME factories when api.token.constructor is on.
+        if (g_.api_token_constructor) {
+            hdr << "        class symbol_type {\n";
+            hdr << "        public:\n";
+            hdr << "            symbol_type() : kind(token::YYEMPTY) {}\n";
+            hdr << "            symbol_type(int k) : kind(token::yytokentype(k)) {}\n";
+            hdr << "            template <typename V>\n";
+            hdr << "            symbol_type(int k, V&& v) : kind(token::yytokentype(k)),\n";
+            hdr << "                value(std::forward<V>(v)) {}\n";
+            if (g_.want_locations) {
+                hdr << "            template <typename V>\n";
+                hdr << "            symbol_type(int k, V&& v, location_type l)\n";
+                hdr << "                : kind(token::yytokentype(k)),\n";
+                hdr << "                  value(std::forward<V>(v)), location(std::move(l)) {}\n";
+            }
+            hdr << "            token::yytokentype kind;\n";
+            hdr << "            semantic_type value;\n";
+            if (g_.want_locations) hdr << "            location_type location;\n";
+            hdr << "        };\n";
+            // Per-token make_NAME factory.
+            for (int i = 0; i < (int)g_.syms.size(); i++) {
+                const auto& s = g_.syms[i];
+                if (!s.is_terminal || s.code <= 0) continue;
+                if (s.name.empty() || s.name[0] == '\'' || s.name[0] == '"') continue;
+                if (s.code == 256 || s.code == 257) continue;
+                std::string fname = "make_" + g_.token_prefix + s.name;
+                std::string ttag = s.type_tag;
+                hdr << "        static symbol_type " << fname << "(";
+                if (!ttag.empty()) hdr << ttag << " v";
+                if (!ttag.empty() && g_.want_locations) hdr << ", ";
+                if (g_.want_locations) hdr << "location_type l";
+                hdr << ") {\n";
+                hdr << "            symbol_type r;\n";
+                hdr << "            r.kind = token::" << g_.token_prefix << s.name << ";\n";
+                if (!ttag.empty())
+                    hdr << "            r.value.template emplace<" << ttag << ">(std::move(v));\n";
+                if (g_.want_locations)
+                    hdr << "            r.location = std::move(l);\n";
+                hdr << "            return r;\n";
+                hdr << "        }\n";
+            }
+        }
+
         hdr << "\n";
         hdr << "        " << g_.api_parser_class << "();\n";
         hdr << "        virtual ~" << g_.api_parser_class << "();\n";
@@ -3198,14 +3241,22 @@ private:
         if (!g_.prologue_provides.empty())
             hdr << "/* %code provides */\n" << g_.prologue_provides << "\n";
 
-        // The user provides yylex as a free function in pure-parser style.
-        hdr << "extern int yylex(" << g_.api_namespace << "::"
-            << g_.api_parser_class << "::semantic_type *yylval";
-        if (g_.want_locations) {
-            hdr << ", " << g_.api_namespace << "::"
-                << g_.api_parser_class << "::location_type *yylloc";
+        // yylex prototype.  With api.token.constructor the user returns
+        // symbol_type via the make_NAME factories; otherwise it's the
+        // pure-parser style with semantic_type* (and location_type* when
+        // %locations is on).
+        if (g_.api_token_constructor) {
+            hdr << "extern " << g_.api_namespace << "::"
+                << g_.api_parser_class << "::symbol_type yylex();\n";
+        } else {
+            hdr << "extern int yylex(" << g_.api_namespace << "::"
+                << g_.api_parser_class << "::semantic_type *yylval";
+            if (g_.want_locations) {
+                hdr << ", " << g_.api_namespace << "::"
+                    << g_.api_parser_class << "::location_type *yylloc";
+            }
+            hdr << ");\n";
         }
-        hdr << ");\n";
         hdr << "#endif\n";
     }
 
@@ -3353,8 +3404,18 @@ private:
         out << "    if (yystate == YYFINAL) { yyresult = 0; goto yyreturn; }\n";
         out << "    yyn = yypact[yystate];\n";
         out << "    if (yypact_value_is_default(yyn)) goto yydefault;\n";
-        if (L) out << "    if (yychar == -2) yychar = yylex(&yylval, &yylloc);\n";
-        else   out << "    if (yychar == -2) yychar = yylex(&yylval);\n";
+        if (g_.api_token_constructor) {
+            out << "    if (yychar == -2) {\n";
+            out << "        auto _tok = yylex();\n";
+            out << "        yychar = (int)_tok.kind;\n";
+            out << "        yylval = std::move(_tok.value);\n";
+            if (L) out << "        yylloc = std::move(_tok.location);\n";
+            out << "    }\n";
+        } else if (L) {
+            out << "    if (yychar == -2) yychar = yylex(&yylval, &yylloc);\n";
+        } else {
+            out << "    if (yychar == -2) yychar = yylex(&yylval);\n";
+        }
         out << "    if (yychar <= 0) { yychar = 0; yytoken = 0; }\n";
         out << "    else yytoken = YYTRANSLATE(yychar);\n";
         out << "    yyn += yytoken;\n";
