@@ -1895,26 +1895,45 @@ private:
                 }
             }
         }
-        // Default reductions (only for states where the only non-error action is one reduce).
+        // Default reductions: pick the most common reduce action in the
+        // state and use it as yydefact[s].  Prune row entries that equal
+        // this default; the runtime falls through to yydefact when the
+        // yytable lookup misses.  This works for explicit-error tokens
+        // too -- they'd previously error immediately, now they default-
+        // reduce first, then fail on the post-reduce state lookup -- a
+        // standard table-compression trade-off (delayed error detection
+        // for tighter tables).  Skip when parse.lac=full or parse.error
+        // is verbose/detailed, since those modes need precise per-token
+        // expected-set walks of yypact.
+        const bool keep_explicit =
+            (g_.parse_lac == "full") ||
+            (g_.parse_error_mode == "verbose") ||
+            (g_.parse_error_mode == "detailed");
         for (int s = 0; s < nS; s++) {
-            int last = 0; int distinct = 0; int reduces = 0; bool shift = false;
+            std::unordered_map<int, int> reduce_counts;  // -rule -> count
+            int best_rule = 0, best_count = 0;
             for (int t = 0; t < nT; t++) {
                 int a = action_[s * nT + t];
-                if (a == 0 || a == ERR_MARK) continue;
-                if (a == ACCEPT) { /* accept doesn't block default */ continue; }
-                if (a > 0) shift = true;
-                else if (a < 0) {
-                    if (last == 0) { last = a; distinct = 1; }
-                    else if (last != a) distinct++;
-                    reduces++;
+                if (a < 0 && a != ERR_MARK) {
+                    int n = ++reduce_counts[a];
+                    if (n > best_count) { best_count = n; best_rule = a; }
                 }
             }
-            if (!shift && reduces > 0 && distinct == 1) {
-                default_reduce_[s] = -last;
+            if (best_rule == 0) continue;
+            // Conservative mode: only default when no shifts and exactly
+            // one reduce-rule appears (matches the previous behaviour and
+            // preserves precise error reporting).
+            if (keep_explicit) {
+                bool shift = false;
                 for (int t = 0; t < nT; t++) {
-                    if (action_[s * nT + t] == last) action_[s * nT + t] = 0;
+                    int a = action_[s * nT + t];
+                    if (a > 0 && a != ACCEPT) { shift = true; break; }
                 }
+                if (shift || reduce_counts.size() != 1) continue;
             }
+            default_reduce_[s] = -best_rule;
+            for (int t = 0; t < nT; t++)
+                if (action_[s * nT + t] == best_rule) action_[s * nT + t] = 0;
         }
     }
 
@@ -2451,41 +2470,61 @@ private:
             }
             if (!r.entries.empty()) rows.push_back(std::move(r));
         }
-        // Pack denser rows first.
+        // Pack widest rows first (col_span = last_col - first_col + 1),
+        // breaking ties by descending entry count.  Wide+dense rows pin
+        // the table's maximum column reach early, leaving narrow/sparse
+        // rows to drop into the gaps without extending the span.  For
+        // PG-class grammars this dramatically tightens the final layout.
+        // Standard table-compression heuristic (Tarjan & Yao 1979 onwards).
         std::stable_sort(rows.begin(), rows.end(),
             [](const Row& a, const Row& b) {
+                int spa = a.entries.empty() ? 0
+                    : (a.entries.back().first - a.entries.front().first + 1);
+                int spb = b.entries.empty() ? 0
+                    : (b.entries.back().first - b.entries.front().first + 1);
+                if (spa != spb) return spa > spb;
                 return a.entries.size() > b.entries.size();
             });
 
-        // Strict packing.  Speed-critical for big grammars (PostgreSQL has
-        // ~5000 states / ~500 terminals -- the naive O(rows * bases * domain)
-        // scan was minutes; replaced with O(1) forbidden-base lookup.
+        // Strict packing for PG-class grammars.  Three accelerators:
         //
-        // Plus row dedup: states whose (col, action) sets are identical can
-        // share a base.  Probing yytable[base+col] returns the same action
-        // for every state pointing at this base, so the lookup is correct
-        // for all of them.  Dedup is the key to bison-comparable table
-        // sizes for grammars with lots of similar states (PostgreSQL has
-        // ~5000 states but only ~2000 unique action rows).
+        // (1) Row dedup.  States whose (col, action) sets are identical can
+        //     share a base; probing yytable[base+col] returns the right
+        //     action for every state pointing there.  Hash by the byte
+        //     serialization of the entry list.  This alone shaved ~50%
+        //     off PG's table.
         //
-        // Invariant on bases: claim (idx, c) creates a false-positive when a
-        // future row R' at base b' probes col=c' with col' in [0, R'.domain)
-        // and b'+col' == idx, c' == c.  Solving: b' = idx - c, valid only
-        // when c < R'.domain.  Since b' = base of THIS row (idx-c == base
-        // for all entries placed by this row), each row contributes exactly
-        // its base to the forbidden set of any row whose domain covers some
-        // entry's c.
+        // (2) "Lowest-free" watermark.  After each placement, walk an
+        //     index forward until it hits an unclaimed cell.  Subsequent
+        //     rows start their base search at (lowest_free - first_col),
+        //     skipping the dense head of the table that's already
+        //     saturated.  Without this, every row re-scans from base 0.
         //
-        // Action rows have domain=nT, so col < nT always; goto rows have
-        // domain=nS (>= nT), col < nS.  The two checking-row types see
-        // different forbidden sets, so we track them separately.
-        std::unordered_set<int> forbidden_for_action;
-        std::unordered_set<int> forbidden_for_goto;
-        forbidden_for_action.reserve(rows.size());
-        forbidden_for_goto.reserve(rows.size());
-        // Map (sorted entries serialized) -> base, separate per row-type
-        // since action and goto rows can't actually share even if entries
-        // happen to coincide (different domains).
+        // (3) Bitset for forbidden-base lookup (replaces unordered_set).
+        //     A future row at the same base would land on the same cells
+        //     and trigger false-positive yycheck matches, so each placed
+        //     base is recorded.  The bitset is keyed by (base + bias)
+        //     where bias covers the most-negative possible base.
+        //
+        // Two forbidden-base sets, one per row-type domain.  Action rows
+        // (domain = nT) only see prior bases whose claims have any col
+        // below nT; goto rows (domain = nS) see every prior base.
+        std::vector<bool> forbidden_for_action;
+        std::vector<bool> forbidden_for_goto;
+        const int base_bias = std::max(nT, nS) + 4;
+        auto forbid_query = [&](const std::vector<bool>& v, int base) {
+            int i = base + base_bias;
+            return i >= 0 && i < (int)v.size() && v[i];
+        };
+        auto forbid_mark = [&](std::vector<bool>& v, int base) {
+            int i = base + base_bias;
+            if (i < 0) return;
+            if (i >= (int)v.size()) v.resize(i + 1, false);
+            v[i] = true;
+        };
+
+        // Dedup map per row-type (action vs goto can't share even if
+        // entries coincide -- different domains).
         std::unordered_map<std::string, int> action_dedup;
         std::unordered_map<std::string, int> goto_dedup;
         auto fingerprint = [](const Row& r) {
@@ -2497,9 +2536,19 @@ private:
             }
             return s;
         };
+
+        // Smallest claimed[] index that is currently unclaimed.  Maintained
+        // incrementally: after each placement we walk forward past any
+        // cells that just became claimed.
+        int lowest_free = 0;
+        auto walk_lowest_free = [&]() {
+            while (lowest_free < (int)claimed.size() &&
+                   claimed[lowest_free] != -1)
+                lowest_free++;
+        };
+
         for (const Row& r : rows) {
-            // Dedup: if a row with the same entries is already placed,
-            // reuse its base.
+            // Dedup: identical entry list -> reuse the existing base.
             std::string fp = fingerprint(r);
             auto& dedup_map = r.is_goto ? goto_dedup : action_dedup;
             auto it = dedup_map.find(fp);
@@ -2509,14 +2558,16 @@ private:
                 else           yypact[r.row_id]  = base;
                 continue;
             }
-            int min_col = r.entries.front().first;
-            for (auto& e : r.entries) min_col = std::min(min_col, e.first);
-            int base = -min_col;
+
+            // Search for a base.  Entries are col-sorted, so the smallest
+            // entry idx after placement will be (base + first_col); we
+            // start with that landing on lowest_free.
+            const int first_col = r.entries.front().first;
+            int base = lowest_free - first_col;
             const auto& my_forbidden = r.is_goto ? forbidden_for_goto
                                                  : forbidden_for_action;
             for (;;) {
-                if (my_forbidden.count(base)) { base++; continue; }
-                // r's used cols must land on unclaimed cells.
+                if (forbid_query(my_forbidden, base)) { base++; continue; }
                 bool ok = true;
                 for (auto& e : r.entries) {
                     int idx = base + e.first;
@@ -2528,6 +2579,7 @@ private:
                 if (ok) break;
                 base++;
             }
+
             // Place.
             bool has_small_col = false;
             for (auto& e : r.entries) {
@@ -2544,14 +2596,14 @@ private:
                     yycheck[idx] = e.first;
                 }
             }
-            // Update forbidden sets.  Goto-checkers see every prior base;
-            // action-checkers only see prior bases that placed at least
-            // one cell with col < nT.
-            forbidden_for_goto.insert(base);
-            if (has_small_col) forbidden_for_action.insert(base);
+
+            forbid_mark(forbidden_for_goto, base);
+            if (has_small_col) forbid_mark(forbidden_for_action, base);
             dedup_map.emplace(std::move(fp), base);
             if (r.is_goto) yypgoto[r.row_id] = base;
             else            yypact[r.row_id]  = base;
+
+            walk_lowest_free();
         }
         out << "#define YYPACT_NINF " << NINF << "\n";
         out << "#define yypact_value_is_default(Yyn) ((Yyn) == YYPACT_NINF)\n";
