@@ -188,6 +188,14 @@ struct Grammar {
     // driver.  Conflicts are kept as multiple parse-paths run lock-step,
     // resolved at merge points by %dprec (higher wins) or %merge function.
     bool is_glr = false;
+    // %language "c++" / %skeleton "lalr1.cc" -- emit a C++ parser class
+    // ("namespace yy { class parser { ... }; }") instead of the C
+    // skeleton's free-function yyparse().
+    bool is_cxx = false;
+    // %define api.namespace -- C++ skeleton namespace (default "yy").
+    string api_namespace = "yy";
+    // %define api.parser.class -- C++ parser class name (default "parser").
+    string api_parser_class = "parser";
     // %define parse.lac: none (default) | full
     // When full, the verbose error helper does an exploratory parse so the
     // expected-token list excludes tokens that would default-reduce and
@@ -760,8 +768,25 @@ private:
                     advance();
                 }
                 return;
-            case Tok::PercentLanguage:
-            case Tok::PercentSkeleton:
+            case Tok::PercentLanguage: {
+                advance();
+                if (at(Tok::StrLit) || at(Tok::Identifier)) {
+                    string v = peek_.text;
+                    // Normalize: treat "c++"/"C++" identically.
+                    for (char& c : v) c = (char)std::tolower((unsigned char)c);
+                    if (v == "c++") g_.is_cxx = true;
+                    advance();
+                }
+                return;
+            }
+            case Tok::PercentSkeleton: {
+                advance();
+                if (at(Tok::StrLit) || at(Tok::Identifier)) {
+                    if (peek_.text == "lalr1.cc") g_.is_cxx = true;
+                    advance();
+                }
+                return;
+            }
             case Tok::PercentOutput:
             case Tok::PercentFilePrefix:
                 advance();
@@ -908,6 +933,9 @@ private:
             else if (name == "parse.lac") g_.parse_lac = v;
             else if (name == "lr.type") g_.lr_type = v;
             else if (name == "api.location.type") g_.api_location_type = v;
+            else if (name == "api.namespace") g_.api_namespace = v;
+            else if (name == "api.parser.class" ||
+                     name == "api.parser.class.name") g_.api_parser_class = v;
         } else if (at(Tok::BraceBlock)) {
             // Braced value: keep raw braces for api.value.type but strip
             // them for prefix-like settings whose value is the body.
@@ -925,6 +953,9 @@ private:
             else if (name == "api.token.prefix") g_.token_prefix = body;
             else if (name == "api.location.type") g_.api_location_type = body;
             else if (name == "api.push-pull") g_.api_push_pull = body;
+            else if (name == "api.namespace") g_.api_namespace = body;
+            else if (name == "api.parser.class" ||
+                     name == "api.parser.class.name") g_.api_parser_class = body;
             advance();
         } else {
             // %define NAME (no value) — treat as "true".
@@ -2054,6 +2085,7 @@ public:
     }
 
     void emit(Buf out, Buf* hdr) {
+        if (g_.is_cxx) { emit_cxx_main(out, hdr); return; }
         emit_prefix(out);
         if (hdr) emit_prefix(*hdr);
 
@@ -3004,6 +3036,249 @@ private:
         out << "# define YY_REDUCE_PRINT(R) do {} while (0)\n";
         out << "# define YY_STACK_PRINT(B, T) do {} while (0)\n";
         out << "#endif\n";
+    }
+
+    // ============================================================
+    // C++ output skeleton (%language "c++" / %skeleton "lalr1.cc").
+    // Stage 1: parser class with token enum, parse(), error().
+    // No locations, variant, push parser, error recovery, or LAC --
+    // those land in subsequent stages.
+    // ============================================================
+
+    void emit_cxx_class_header(Buf out) {
+        // Emit token enum with bison's nested-struct shape:
+        //   parser::token::yytokentype
+        // The "TOK_" prefix on YYEOF/YYerror/YYUNDEF mirrors bison.
+        out << "        struct token {\n";
+        out << "            enum yytokentype {\n";
+        out << "                YYEMPTY = -2,\n";
+        out << "                YYEOF = 0,\n";
+        out << "                YYerror = 256,\n";
+        out << "                YYUNDEF = 257,\n";
+        for (int i = 0; i < (int)g_.syms.size(); i++) {
+            const auto& s = g_.syms[i];
+            if (!s.is_terminal || s.code < 0) continue;
+            if (s.code == 0 || s.code == 256 || s.code == 257) continue;
+            // Skip char-literal pseudo-symbols and string-alias entries.
+            if (!s.name.empty() && s.name[0] == '\'') continue;
+            if (!s.name.empty() && s.name[0] == '"') continue;
+            if (s.name.empty()) continue;
+            out << "                " << g_.token_prefix << s.name
+                << " = " << s.code << ",\n";
+        }
+        out << "            };\n";
+        out << "            typedef yytokentype yytoken_kind_t;\n";
+        out << "        };\n";
+        out << "        typedef token::yytoken_kind_t token_kind_type;\n";
+    }
+
+    void emit_cxx_header(Buf hdr) {
+        // Header guard derived from the class+namespace.
+        std::string guard = "YY_" + g_.api_namespace + "_" + g_.api_parser_class + "_HH";
+        for (char& c : guard) c = (char)std::toupper((unsigned char)c);
+        hdr << "// Generated by yacc.cpp (C++ skeleton)\n";
+        hdr << "#ifndef " << guard << "\n";
+        hdr << "#define " << guard << "\n\n";
+        hdr << "#include <string>\n\n";
+
+        if (!g_.prologue_requires.empty())
+            hdr << "/* %code requires */\n" << g_.prologue_requires << "\n";
+
+        hdr << "namespace " << g_.api_namespace << " {\n";
+        hdr << "    class " << g_.api_parser_class << " {\n";
+        hdr << "    public:\n";
+
+        // semantic_type: the C++ semantic-value type.
+        if (g_.api_value_type.empty() || g_.api_value_type == "int") {
+            hdr << "        typedef int semantic_type;\n";
+        } else if (g_.api_value_type.size() >= 2 && g_.api_value_type.front() == '{'
+                   && g_.api_value_type.back() == '}') {
+            hdr << "        typedef "
+                << g_.api_value_type.substr(1, g_.api_value_type.size() - 2)
+                << " semantic_type;\n";
+        } else {
+            hdr << "        typedef " << g_.api_value_type << " semantic_type;\n";
+        }
+
+        emit_cxx_class_header(hdr);
+
+        hdr << "\n";
+        hdr << "        " << g_.api_parser_class << "();\n";
+        hdr << "        virtual ~" << g_.api_parser_class << "();\n";
+        hdr << "        virtual int parse();\n";
+        hdr << "        virtual void error(const std::string& msg);\n";
+        hdr << "    };\n";
+        hdr << "}\n\n";
+
+        if (!g_.prologue_provides.empty())
+            hdr << "/* %code provides */\n" << g_.prologue_provides << "\n";
+
+        // The user provides yylex as a free function in pure-parser style,
+        // taking a pointer to a semantic_type to fill in.
+        hdr << "extern int yylex(" << g_.api_namespace << "::"
+            << g_.api_parser_class << "::semantic_type *yylval);\n";
+        hdr << "#endif\n";
+    }
+
+    // Plain switch-based action body (re-uses translate_action which already
+    // produces (yyval) / (yyvsp[N]) references that work in C++ unchanged).
+    void emit_cxx_action_switch(Buf out) {
+        for (int i = 1; i < l_.n_rules(); i++) {
+            const Production& p = l_.prod(i);
+            if (p.action.empty()) continue;
+            out << "    case " << i << ":\n";
+            out << "      { " << translate_action(p) << " }\n";
+            out << "      break;\n";
+        }
+    }
+
+    void emit_cxx_main(Buf out, Buf* hdr) {
+        // Header.  When invoked without -d we still emit one, since the
+        // class declaration goes there in C++.
+        if (hdr) emit_cxx_header(*hdr);
+
+        // Source.
+        if (!g_.prologue_top.empty()) out << g_.prologue_top << "\n";
+        out << "// Generated by yacc.cpp (C++ skeleton)\n";
+        out << "#include <cstdio>\n";
+        out << "#include <cstdlib>\n";
+        out << "#include <cstring>\n";
+        out << "#include <string>\n";
+        // For -d we emit the header above and include it; otherwise emit
+        // the class declaration inline so the .cc compiles standalone.
+        if (hdr) {
+            // A common convention: header file shares the source's stem.
+            // The user invokes us with `-o foo.tab.cc -d` and ends up with
+            // foo.tab.hh; the default include path is the same directory.
+            // We don't know the exact name here, so re-emit the class decl
+            // inline as a safety net (compiler will still see the header
+            // first if the user includes it).
+            out << "// Inline class declaration fallback:\n";
+        }
+        std::string hbuf;
+        Buf tmp{hbuf};
+        emit_cxx_header(tmp);
+        out << hbuf;
+
+        if (!g_.prologue_requires.empty()) out << g_.prologue_requires << "\n";
+        if (!g_.prologue.empty()) {
+            if (!opts_.no_lines) out << "#line 1 \"" << g_.source_file << "\"\n";
+            out << g_.prologue << "\n";
+        }
+        if (!g_.prologue_late.empty()) {
+            if (!opts_.no_lines) out << "#line 1 \"" << g_.source_file << "\"\n";
+            out << g_.prologue_late << "\n";
+        }
+
+        // YYSTYPE alias to the class's semantic_type, so translate_action
+        // (which emits yyval / yyvsp[N]) compiles unchanged.
+        out << "typedef " << g_.api_namespace << "::" << g_.api_parser_class
+            << "::semantic_type YYSTYPE;\n";
+
+        // Tables.  These reuse the C-side emitters as-is (the arrays are
+        // plain static const short[], legal C++).
+        emit_constants(out);
+        emit_translation_table(out);
+        emit_compressed_tables(out);
+        emit_misc_tables(out);
+
+        // Class implementation.
+        out << "namespace " << g_.api_namespace << " {\n";
+        out << g_.api_parser_class << "::" << g_.api_parser_class << "() {}\n";
+        out << g_.api_parser_class << "::~" << g_.api_parser_class << "() {}\n";
+        // error() is declared in the header but NOT defined here -- the
+        // user must override.  Same contract as bison's lalr1.cc.
+
+        // The state machine.  Same shift-reduce logic as the C driver, but
+        // class-scoped: yyerror -> error(), no parse-param plumbing yet,
+        // no error recovery beyond a single error report and abort.
+        out << "int " << g_.api_parser_class << "::parse() {\n";
+        out << "    semantic_type yylval{};\n";
+        out << "    int yychar = -2;\n";
+        out << "    int yystate = 0;\n";
+        out << "    int yyn = 0;\n";
+        out << "    int yytoken = -2;\n";
+        out << "    int yylen = 0;\n";
+        out << "    semantic_type yyval{};\n";
+        out << "    short yyssa[YYINITDEPTH];\n";
+        out << "    semantic_type yyvsa[YYINITDEPTH];\n";
+        out << "    short *yyss = yyssa;\n";
+        out << "    semantic_type *yyvs = yyvsa;\n";
+        out << "    short *yyssp = yyss;\n";
+        out << "    semantic_type *yyvsp = yyvs;\n";
+        out << "    int yystacksize = YYINITDEPTH;\n";
+        out << "    *yyssp = 0;\n";
+        out << "    int yyresult = 1;\n";
+        out << "    goto yysetstate;\n";
+        out << "yynewstate:\n";
+        out << "    yyssp++;\n";
+        out << "yysetstate:\n";
+        out << "    *yyssp = (short)yystate;\n";
+        out << "    if (yyss + yystacksize - 1 <= yyssp) {\n";
+        out << "        // Stage 1: stack overflow -> abort.  Stack growth\n";
+        out << "        // arrives in a later stage along with destructors.\n";
+        out << "        error(\"memory exhausted\");\n";
+        out << "        yyresult = 2;\n";
+        out << "        goto yyreturn;\n";
+        out << "    }\n";
+        out << "    if (yystate == YYFINAL) { yyresult = 0; goto yyreturn; }\n";
+        out << "    yyn = yypact[yystate];\n";
+        out << "    if (yypact_value_is_default(yyn)) goto yydefault;\n";
+        out << "    if (yychar == -2) yychar = yylex(&yylval);\n";
+        out << "    if (yychar <= 0) { yychar = 0; yytoken = 0; }\n";
+        out << "    else yytoken = YYTRANSLATE(yychar);\n";
+        out << "    yyn += yytoken;\n";
+        out << "    if (yyn < 0 || yyn >= (int)YYTABLE_SIZE || yycheck[yyn] != yytoken)\n";
+        out << "        goto yydefault;\n";
+        out << "    yyn = yytable[yyn];\n";
+        out << "    if (yyn <= 0) {\n";
+        out << "        if (yytable_value_is_error(yyn)) goto yyerrlab;\n";
+        out << "        if (yyn == 0) { yyresult = 0; goto yyreturn; }\n";
+        out << "        yyn = -yyn;\n";
+        out << "        goto yyreduce;\n";
+        out << "    }\n";
+        out << "    // Shift.\n";
+        out << "    yystate = yyn;\n";
+        out << "    *++yyvsp = yylval;\n";
+        out << "    yychar = -2;\n";
+        out << "    goto yynewstate;\n";
+        out << "yydefault:\n";
+        out << "    yyn = yydefact[yystate];\n";
+        out << "    if (yyn == 0) goto yyerrlab;\n";
+        out << "    goto yyreduce;\n";
+        out << "yyreduce:\n";
+        out << "    yylen = yyr2[yyn];\n";
+        out << "    if (yylen) yyval = yyvsp[1 - yylen];\n";
+        out << "    else yyval = semantic_type{};\n";
+        out << "    switch (yyn) {\n";
+        emit_cxx_action_switch(out);
+        out << "    default: break;\n";
+        out << "    }\n";
+        out << "    yyssp -= yylen;\n";
+        out << "    yyvsp -= yylen;\n";
+        out << "    *++yyvsp = yyval;\n";
+        out << "    {\n";
+        out << "        int nt = yyr1[yyn] - YYNTOKENS;\n";
+        out << "        int gpos = yypgoto[nt] + *yyssp;\n";
+        out << "        if (gpos >= 0 && gpos < (int)YYTABLE_SIZE && yycheck[gpos] == *yyssp)\n";
+        out << "            yystate = yytable[gpos];\n";
+        out << "        else\n";
+        out << "            yystate = yydefgoto[nt];\n";
+        out << "    }\n";
+        out << "    goto yynewstate;\n";
+        out << "yyerrlab:\n";
+        out << "    error(\"syntax error\");\n";
+        out << "    yyresult = 1;\n";
+        out << "yyreturn:\n";
+        out << "    if (yyss != yyssa) { std::free(yyss); std::free(yyvs); }\n";
+        out << "    return yyresult;\n";
+        out << "}\n";
+        out << "}  // namespace " << g_.api_namespace << "\n";
+
+        if (!g_.epilogue.empty()) {
+            if (!opts_.no_lines) out << "\n#line 1 \"" << g_.source_file << "\"\n";
+            out << g_.epilogue;
+        }
     }
 
     void emit_driver(Buf out) {
@@ -4473,11 +4748,19 @@ static int run(int argc, char** argv) {
     LALR la(g);
     la.build();
 
+    // Bison's convention: C++ skeletons emit .tab.cc + .tab.hh; C
+    // skeletons emit .tab.c + .tab.h.
+    const char* src_ext = g.is_cxx ? ".tab.cc" : ".tab.c";
+    const char* hdr_ext = g.is_cxx ? ".tab.hh" : ".tab.h";
     string outpath, headerpath;
     if (out_arg.empty()) {
-        if (opts.yacc_compat) { outpath = "y.tab.c"; headerpath = "y.tab.h"; }
+        if (opts.yacc_compat) {
+            outpath = string("y") + src_ext;
+            headerpath = string("y") + hdr_ext;
+        }
         else if (!opts.file_prefix.empty()) {
-            outpath = opts.file_prefix + ".tab.c"; headerpath = opts.file_prefix + ".tab.h";
+            outpath = opts.file_prefix + src_ext;
+            headerpath = opts.file_prefix + hdr_ext;
         } else {
             string base = input;
             size_t slash = base.find_last_of("/\\");
@@ -4485,13 +4768,24 @@ static int run(int argc, char** argv) {
             string fname = (slash == string::npos) ? base : base.substr(slash + 1);
             size_t dot = fname.find_last_of('.');
             string stem = (dot == string::npos) ? fname : fname.substr(0, dot);
-            outpath = dir + stem + ".tab.c";
-            headerpath = dir + stem + ".tab.h";
+            outpath = dir + stem + src_ext;
+            headerpath = dir + stem + hdr_ext;
         }
     } else {
         outpath = out_arg;
         size_t dot = outpath.find_last_of('.');
-        headerpath = (dot == string::npos) ? outpath + ".h" : outpath.substr(0, dot) + ".h";
+        // Map .cc/.cpp/.cxx -> .hh/.hpp/.hxx for C++; otherwise plain .h.
+        if (dot == string::npos) headerpath = outpath + hdr_ext;
+        else if (g.is_cxx) {
+            string stem = outpath.substr(0, dot);
+            string ext = outpath.substr(dot);
+            if (ext == ".cc") headerpath = stem + ".hh";
+            else if (ext == ".cpp") headerpath = stem + ".hpp";
+            else if (ext == ".cxx") headerpath = stem + ".hxx";
+            else headerpath = stem + ".hh";
+        } else {
+            headerpath = outpath.substr(0, dot) + ".h";
+        }
     }
     if (!opts.defines_path.empty()) headerpath = opts.defines_path;
 

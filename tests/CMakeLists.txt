@@ -55,6 +55,7 @@ foreach(CASE_NAME ${TEST_DIRS})
                     -DGEN=${GEN}
                     -DGEN_BIN=${GEN_BIN}
                     -DC_COMPILER=${CMAKE_C_COMPILER}
+                    -DCXX_COMPILER=${CMAKE_CXX_COMPILER}
                     -P ${RUNNER}
             )
             set_tests_properties(${GEN}_${CASE_NAME} PROPERTIES TIMEOUT 60)

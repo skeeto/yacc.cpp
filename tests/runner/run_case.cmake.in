@@ -4,8 +4,16 @@
 #   GEN          - "bison" or "yacc"
 #   GEN_BIN      - generator executable
 #   C_COMPILER   - C compiler
+#   CXX_COMPILER - C++ compiler (used when driver.cc is present)
 
 file(MAKE_DIRECTORY ${WORK_DIR})
+
+# A test is C++ if driver.cc exists in the case dir.  C++ cases use g++,
+# generate .tab.cc + .tab.hh, and link against the lalr1.cc skeleton.
+set(IS_CXX 0)
+if(EXISTS ${CASE_DIR}/driver.cc)
+    set(IS_CXX 1)
+endif()
 
 # Read optional options.txt
 set(EXTRA_OPTS "")
@@ -27,11 +35,16 @@ endif()
 # Generate parser
 file(COPY ${CASE_DIR}/grammar.y DESTINATION ${WORK_DIR})
 
-set(OUTPUT_C ${WORK_DIR}/grammar.tab.c)
-set(OUTPUT_H ${WORK_DIR}/grammar.tab.h)
+if(IS_CXX)
+    set(OUTPUT_SRC ${WORK_DIR}/grammar.tab.cc)
+    set(OUTPUT_HDR ${WORK_DIR}/grammar.tab.hh)
+else()
+    set(OUTPUT_SRC ${WORK_DIR}/grammar.tab.c)
+    set(OUTPUT_HDR ${WORK_DIR}/grammar.tab.h)
+endif()
 
 execute_process(
-    COMMAND ${GEN_BIN} -d -o ${OUTPUT_C} ${EXTRA_OPTS} ${WORK_DIR}/grammar.y
+    COMMAND ${GEN_BIN} -d -o ${OUTPUT_SRC} ${EXTRA_OPTS} ${WORK_DIR}/grammar.y
     WORKING_DIRECTORY ${WORK_DIR}
     RESULT_VARIABLE GEN_RC
     OUTPUT_VARIABLE GEN_OUT
@@ -41,31 +54,44 @@ if(NOT GEN_RC EQUAL 0)
     message(FATAL_ERROR "${GEN} failed (rc=${GEN_RC}):\nstdout: ${GEN_OUT}\nstderr: ${GEN_ERR}")
 endif()
 
-if(NOT EXISTS ${OUTPUT_C})
-    message(FATAL_ERROR "${GEN} did not produce ${OUTPUT_C}")
+if(NOT EXISTS ${OUTPUT_SRC})
+    message(FATAL_ERROR "${GEN} did not produce ${OUTPUT_SRC}")
 endif()
-
-# Compile driver + generated parser
-set(DRIVER_C ${CASE_DIR}/driver.c)
-if(NOT EXISTS ${DRIVER_C})
-    message(FATAL_ERROR "missing driver.c in ${CASE_DIR}")
-endif()
-file(COPY ${DRIVER_C} DESTINATION ${WORK_DIR})
 
 set(EXE ${WORK_DIR}/test_prog)
 if(WIN32)
     set(EXE ${EXE}.exe)
 endif()
 
-execute_process(
-    COMMAND ${C_COMPILER} -std=c11 -O0 -g -Wno-unused -Wno-implicit-fallthrough
-            -Wno-deprecated-non-prototype -Wno-implicit-function-declaration
-            -Wno-error=implicit-function-declaration
-            -I${WORK_DIR} ${WORK_DIR}/grammar.tab.c ${WORK_DIR}/driver.c -o ${EXE}
-    RESULT_VARIABLE CC_RC
-    OUTPUT_VARIABLE CC_OUT
-    ERROR_VARIABLE  CC_ERR
-)
+if(IS_CXX)
+    set(DRIVER ${CASE_DIR}/driver.cc)
+    if(NOT EXISTS ${DRIVER})
+        message(FATAL_ERROR "missing driver.cc in ${CASE_DIR}")
+    endif()
+    file(COPY ${DRIVER} DESTINATION ${WORK_DIR})
+    execute_process(
+        COMMAND ${CXX_COMPILER} -std=c++17 -O0 -g -Wno-unused -Wno-free-nonheap-object
+                -I${WORK_DIR} ${OUTPUT_SRC} ${WORK_DIR}/driver.cc -o ${EXE}
+        RESULT_VARIABLE CC_RC
+        OUTPUT_VARIABLE CC_OUT
+        ERROR_VARIABLE  CC_ERR
+    )
+else()
+    set(DRIVER ${CASE_DIR}/driver.c)
+    if(NOT EXISTS ${DRIVER})
+        message(FATAL_ERROR "missing driver.c in ${CASE_DIR}")
+    endif()
+    file(COPY ${DRIVER} DESTINATION ${WORK_DIR})
+    execute_process(
+        COMMAND ${C_COMPILER} -std=c11 -O0 -g -Wno-unused -Wno-implicit-fallthrough
+                -Wno-deprecated-non-prototype -Wno-implicit-function-declaration
+                -Wno-error=implicit-function-declaration
+                -I${WORK_DIR} ${OUTPUT_SRC} ${WORK_DIR}/driver.c -o ${EXE}
+        RESULT_VARIABLE CC_RC
+        OUTPUT_VARIABLE CC_OUT
+        ERROR_VARIABLE  CC_ERR
+    )
+endif()
 if(NOT CC_RC EQUAL 0)
     message(FATAL_ERROR "compile failed (rc=${CC_RC}):\nstdout: ${CC_OUT}\nstderr: ${CC_ERR}")
 endif()
