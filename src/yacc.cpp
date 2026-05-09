@@ -3311,6 +3311,28 @@ private:
         // symbol_kind_type (S_NUM, S_program, ...) directly or convert
         // a token kind via this->kind_for(token).
         hdr << "        static const char* symbol_name(symbol_kind_type kind);\n";
+
+        // %define parse.error custom: user overrides report_syntax_error
+        // to format their own message.  context exposes the failing
+        // token's kind and (when %locations is on) location.  Default
+        // returns 1 (YYENOMEM-style fall-through to error()).
+        if (g_.parse_error_mode == "custom") {
+            hdr << "        class context {\n";
+            hdr << "        public:\n";
+            hdr << "            context(symbol_kind_type t";
+            if (g_.want_locations) hdr << ", const location_type* l";
+            hdr << ") : tok(t)";
+            if (g_.want_locations) hdr << ", loc(l)";
+            hdr << " {}\n";
+            hdr << "            symbol_kind_type token() const { return tok; }\n";
+            if (g_.want_locations)
+                hdr << "            const location_type& location() const { return *loc; }\n";
+            hdr << "        private:\n";
+            hdr << "            symbol_kind_type tok;\n";
+            if (g_.want_locations) hdr << "            const location_type* loc;\n";
+            hdr << "        };\n";
+            hdr << "        virtual void report_syntax_error(const context& ctx) const;\n";
+        }
         // %parse-param fields: stored as members so action bodies can
         // refer to them via their declared names.
         if (!g_.parse_params.empty()) {
@@ -3639,8 +3661,19 @@ private:
         out << "    }\n";
         out << "    goto yynewstate;\n";
         out << "yyerrlab:\n";
-        if (L) out << "    error(yylloc, \"syntax error\");\n";
-        else   out << "    error(\"syntax error\");\n";
+        if (g_.parse_error_mode == "custom") {
+            // User's report_syntax_error owns the diagnostic.  Same
+            // contract as bison's lalr1.cc: void return, const method.
+            out << "    {\n";
+            if (L) out << "        context _ctx(symbol_kind_type(yytranslate[yychar]), &yylloc);\n";
+            else   out << "        context _ctx(symbol_kind_type(yytranslate[yychar]));\n";
+            out << "        report_syntax_error(_ctx);\n";
+            out << "    }\n";
+        } else if (L) {
+            out << "    error(yylloc, \"syntax error\");\n";
+        } else {
+            out << "    error(\"syntax error\");\n";
+        }
         out << "    yyresult = 1;\n";
         out << "yyreturn:\n";
         out << "    if (yyss != yyssa) {\n";
