@@ -4455,9 +4455,16 @@ static int run(int argc, char** argv) {
             fatalf("cannot write xml '{}'", xpath);
     }
 
-    if (la.sr_conflicts() > 0)
+    // Suppress the conflict warning when %expect / %expect-rr matches the
+    // actual count.  Bison does the same, and projects (Octave, PG, Bash)
+    // declare exact %expect to gate a clean build.
+    int sr_unexpected = la.sr_conflicts();
+    int rr_unexpected = la.rr_conflicts();
+    if (g.expected_sr >= 0 && g.expected_sr == sr_unexpected) sr_unexpected = 0;
+    if (g.expected_rr >= 0 && g.expected_rr == rr_unexpected) rr_unexpected = 0;
+    if (sr_unexpected > 0)
         write_stderr(std::format("yacc: {} shift/reduce conflict(s)\n", la.sr_conflicts()));
-    if (la.rr_conflicts() > 0)
+    if (rr_unexpected > 0)
         write_stderr(std::format("yacc: {} reduce/reduce conflict(s)\n", la.rr_conflicts()));
     // -Wcounterexamples: list each conflict with a sample input path.
     if (opts.want_counterexamples && !la.conflicts.empty()) {
