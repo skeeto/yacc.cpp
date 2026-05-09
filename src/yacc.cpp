@@ -2461,26 +2461,54 @@ private:
         // ~5000 states / ~500 terminals -- the naive O(rows * bases * domain)
         // scan was minutes; replaced with O(1) forbidden-base lookup.
         //
-        // Invariant: claim (idx, c) creates a false-positive when a future
-        // row R' at base b' probes col=c' with col' in [0, R'.domain) and
-        // b'+col' == idx, c' == c.  Solving: b' = idx - c, valid only when
-        // c < R'.domain.  Since b' = base of THIS row (idx-c == base for all
-        // entries placed by this row), each row contributes exactly its
-        // base to the forbidden set of any row whose domain covers some
+        // Plus row dedup: states whose (col, action) sets are identical can
+        // share a base.  Probing yytable[base+col] returns the same action
+        // for every state pointing at this base, so the lookup is correct
+        // for all of them.  Dedup is the key to bison-comparable table
+        // sizes for grammars with lots of similar states (PostgreSQL has
+        // ~5000 states but only ~2000 unique action rows).
+        //
+        // Invariant on bases: claim (idx, c) creates a false-positive when a
+        // future row R' at base b' probes col=c' with col' in [0, R'.domain)
+        // and b'+col' == idx, c' == c.  Solving: b' = idx - c, valid only
+        // when c < R'.domain.  Since b' = base of THIS row (idx-c == base
+        // for all entries placed by this row), each row contributes exactly
+        // its base to the forbidden set of any row whose domain covers some
         // entry's c.
         //
         // Action rows have domain=nT, so col < nT always; goto rows have
         // domain=nS (>= nT), col < nS.  The two checking-row types see
-        // different forbidden sets, so we track them separately:
-        //   forbidden_for_action_check: bases of rows that placed any
-        //     entry with c < nT.  (Action rows always contribute; goto
-        //     rows contribute iff they hit a small-state column.)
-        //   forbidden_for_goto_check:   bases of all placed rows.
+        // different forbidden sets, so we track them separately.
         std::unordered_set<int> forbidden_for_action;
         std::unordered_set<int> forbidden_for_goto;
         forbidden_for_action.reserve(rows.size());
         forbidden_for_goto.reserve(rows.size());
+        // Map (sorted entries serialized) -> base, separate per row-type
+        // since action and goto rows can't actually share even if entries
+        // happen to coincide (different domains).
+        std::unordered_map<std::string, int> action_dedup;
+        std::unordered_map<std::string, int> goto_dedup;
+        auto fingerprint = [](const Row& r) {
+            std::string s;
+            s.reserve(r.entries.size() * 8);
+            for (auto& e : r.entries) {
+                s.append(reinterpret_cast<const char*>(&e.first),  sizeof(e.first));
+                s.append(reinterpret_cast<const char*>(&e.second), sizeof(e.second));
+            }
+            return s;
+        };
         for (const Row& r : rows) {
+            // Dedup: if a row with the same entries is already placed,
+            // reuse its base.
+            std::string fp = fingerprint(r);
+            auto& dedup_map = r.is_goto ? goto_dedup : action_dedup;
+            auto it = dedup_map.find(fp);
+            if (it != dedup_map.end()) {
+                int base = it->second;
+                if (r.is_goto) yypgoto[r.row_id] = base;
+                else           yypact[r.row_id]  = base;
+                continue;
+            }
             int min_col = r.entries.front().first;
             for (auto& e : r.entries) min_col = std::min(min_col, e.first);
             int base = -min_col;
@@ -2521,6 +2549,7 @@ private:
             // one cell with col < nT.
             forbidden_for_goto.insert(base);
             if (has_small_col) forbidden_for_action.insert(base);
+            dedup_map.emplace(std::move(fp), base);
             if (r.is_goto) yypgoto[r.row_id] = base;
             else            yypact[r.row_id]  = base;
         }
