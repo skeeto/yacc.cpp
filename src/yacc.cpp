@@ -3072,6 +3072,34 @@ private:
         out << "        typedef token::yytoken_kind_t token_kind_type;\n";
     }
 
+    // position/location classes for the C++ skeleton when %locations is on.
+    // Bison's lalr1.cc emits a richer pair (with stream operators, advance
+    // helpers, etc.); for Stage 2 we emit the minimum interface that
+    // grammars commonly use: begin/end positions with line/column, and a
+    // step() helper that collapses a location to a point.
+    void emit_cxx_location_classes(Buf hdr) {
+        // Skip emit if user supplied a custom location type.
+        if (!g_.api_location_type.empty()) return;
+        hdr << "    class position {\n";
+        hdr << "    public:\n";
+        hdr << "        position(int l = 1, int c = 1) : line(l), column(c) {}\n";
+        hdr << "        int line;\n";
+        hdr << "        int column;\n";
+        hdr << "        void lines(int count = 1) { if (count) { line += count; column = 1; } }\n";
+        hdr << "        void columns(int count = 1) { column += count; }\n";
+        hdr << "    };\n";
+        hdr << "    class location {\n";
+        hdr << "    public:\n";
+        hdr << "        location() = default;\n";
+        hdr << "        location(const position& b, const position& e) : begin(b), end(e) {}\n";
+        hdr << "        position begin;\n";
+        hdr << "        position end;\n";
+        hdr << "        void step() { begin = end; }\n";
+        hdr << "        void lines(int count = 1) { end.lines(count); }\n";
+        hdr << "        void columns(int count = 1) { end.columns(count); }\n";
+        hdr << "    };\n";
+    }
+
     void emit_cxx_header(Buf hdr) {
         // Header guard derived from the class+namespace.
         std::string guard = "YY_" + g_.api_namespace + "_" + g_.api_parser_class + "_HH";
@@ -3085,6 +3113,7 @@ private:
             hdr << "/* %code requires */\n" << g_.prologue_requires << "\n";
 
         hdr << "namespace " << g_.api_namespace << " {\n";
+        if (g_.want_locations) emit_cxx_location_classes(hdr);
         hdr << "    class " << g_.api_parser_class << " {\n";
         hdr << "    public:\n";
 
@@ -3100,23 +3129,45 @@ private:
             hdr << "        typedef " << g_.api_value_type << " semantic_type;\n";
         }
 
+        // location_type when %locations is active.
+        if (g_.want_locations) {
+            if (!g_.api_location_type.empty()) {
+                std::string lt = g_.api_location_type;
+                if (lt.size() >= 2 && lt.front() == '{' && lt.back() == '}')
+                    lt = lt.substr(1, lt.size() - 2);
+                hdr << "        typedef " << lt << " location_type;\n";
+            } else {
+                hdr << "        typedef " << g_.api_namespace
+                    << "::location location_type;\n";
+            }
+        }
+
         emit_cxx_class_header(hdr);
 
         hdr << "\n";
         hdr << "        " << g_.api_parser_class << "();\n";
         hdr << "        virtual ~" << g_.api_parser_class << "();\n";
         hdr << "        virtual int parse();\n";
-        hdr << "        virtual void error(const std::string& msg);\n";
+        if (g_.want_locations) {
+            hdr << "        virtual void error(const location_type& loc, "
+                   "const std::string& msg);\n";
+        } else {
+            hdr << "        virtual void error(const std::string& msg);\n";
+        }
         hdr << "    };\n";
         hdr << "}\n\n";
 
         if (!g_.prologue_provides.empty())
             hdr << "/* %code provides */\n" << g_.prologue_provides << "\n";
 
-        // The user provides yylex as a free function in pure-parser style,
-        // taking a pointer to a semantic_type to fill in.
+        // The user provides yylex as a free function in pure-parser style.
         hdr << "extern int yylex(" << g_.api_namespace << "::"
-            << g_.api_parser_class << "::semantic_type *yylval);\n";
+            << g_.api_parser_class << "::semantic_type *yylval";
+        if (g_.want_locations) {
+            hdr << ", " << g_.api_namespace << "::"
+                << g_.api_parser_class << "::location_type *yylloc";
+        }
+        hdr << ");\n";
         hdr << "#endif\n";
     }
 
@@ -3171,9 +3222,16 @@ private:
         }
 
         // YYSTYPE alias to the class's semantic_type, so translate_action
-        // (which emits yyval / yyvsp[N]) compiles unchanged.
+        // (which emits yyval / yyvsp[N]) compiles unchanged.  Same for
+        // YYLTYPE -> location_type when locations are on.
         out << "typedef " << g_.api_namespace << "::" << g_.api_parser_class
             << "::semantic_type YYSTYPE;\n";
+        out << "#define YYSTYPE_IS_DECLARED 1\n";
+        if (g_.want_locations) {
+            out << "typedef " << g_.api_namespace << "::" << g_.api_parser_class
+                << "::location_type YYLTYPE;\n";
+            out << "#define YYLTYPE_IS_DECLARED 1\n";
+        }
 
         // Tables.  These reuse the C-side emitters as-is (the arrays are
         // plain static const short[], legal C++).
@@ -3189,23 +3247,47 @@ private:
         // error() is declared in the header but NOT defined here -- the
         // user must override.  Same contract as bison's lalr1.cc.
 
+        const bool L = g_.want_locations;
+
+        // Default YYLLOC_DEFAULT for the C++ location class -- uses
+        // begin/end positions, not first_line/first_column.  Users may
+        // override by #defining YYLLOC_DEFAULT in their prologue.
+        if (L) {
+            out << "#ifndef YYLLOC_DEFAULT\n";
+            out << "# define YYLLOC_DEFAULT(Cur, Rhs, N)        \\\n";
+            out << "    do {                                    \\\n";
+            out << "        if (N) {                            \\\n";
+            out << "            (Cur).begin = (Rhs)[1].begin;   \\\n";
+            out << "            (Cur).end   = (Rhs)[N].end;     \\\n";
+            out << "        } else {                            \\\n";
+            out << "            (Cur).begin = (Cur).end = (Rhs)[0].end; \\\n";
+            out << "        }                                   \\\n";
+            out << "    } while (0)\n";
+            out << "#endif\n";
+        }
+
         // The state machine.  Same shift-reduce logic as the C driver, but
         // class-scoped: yyerror -> error(), no parse-param plumbing yet,
         // no error recovery beyond a single error report and abort.
         out << "int " << g_.api_parser_class << "::parse() {\n";
         out << "    semantic_type yylval{};\n";
+        if (L) out << "    location_type yylloc{};\n";
         out << "    int yychar = -2;\n";
         out << "    int yystate = 0;\n";
         out << "    int yyn = 0;\n";
         out << "    int yytoken = -2;\n";
         out << "    int yylen = 0;\n";
         out << "    semantic_type yyval{};\n";
+        if (L) out << "    location_type yyloc{};\n";
         out << "    short yyssa[YYINITDEPTH];\n";
         out << "    semantic_type yyvsa[YYINITDEPTH];\n";
+        if (L) out << "    location_type yylsa[YYINITDEPTH];\n";
         out << "    short *yyss = yyssa;\n";
         out << "    semantic_type *yyvs = yyvsa;\n";
+        if (L) out << "    location_type *yyls = yylsa;\n";
         out << "    short *yyssp = yyss;\n";
         out << "    semantic_type *yyvsp = yyvs;\n";
+        if (L) out << "    location_type *yylsp = yyls;\n";
         out << "    int yystacksize = YYINITDEPTH;\n";
         out << "    *yyssp = 0;\n";
         out << "    int yyresult = 1;\n";
@@ -3215,16 +3297,16 @@ private:
         out << "yysetstate:\n";
         out << "    *yyssp = (short)yystate;\n";
         out << "    if (yyss + yystacksize - 1 <= yyssp) {\n";
-        out << "        // Stage 1: stack overflow -> abort.  Stack growth\n";
-        out << "        // arrives in a later stage along with destructors.\n";
-        out << "        error(\"memory exhausted\");\n";
+        if (L) out << "        error(yylloc, \"memory exhausted\");\n";
+        else   out << "        error(\"memory exhausted\");\n";
         out << "        yyresult = 2;\n";
         out << "        goto yyreturn;\n";
         out << "    }\n";
         out << "    if (yystate == YYFINAL) { yyresult = 0; goto yyreturn; }\n";
         out << "    yyn = yypact[yystate];\n";
         out << "    if (yypact_value_is_default(yyn)) goto yydefault;\n";
-        out << "    if (yychar == -2) yychar = yylex(&yylval);\n";
+        if (L) out << "    if (yychar == -2) yychar = yylex(&yylval, &yylloc);\n";
+        else   out << "    if (yychar == -2) yychar = yylex(&yylval);\n";
         out << "    if (yychar <= 0) { yychar = 0; yytoken = 0; }\n";
         out << "    else yytoken = YYTRANSLATE(yychar);\n";
         out << "    yyn += yytoken;\n";
@@ -3240,6 +3322,7 @@ private:
         out << "    // Shift.\n";
         out << "    yystate = yyn;\n";
         out << "    *++yyvsp = yylval;\n";
+        if (L) out << "    *++yylsp = yylloc;\n";
         out << "    yychar = -2;\n";
         out << "    goto yynewstate;\n";
         out << "yydefault:\n";
@@ -3250,13 +3333,16 @@ private:
         out << "    yylen = yyr2[yyn];\n";
         out << "    if (yylen) yyval = yyvsp[1 - yylen];\n";
         out << "    else yyval = semantic_type{};\n";
+        if (L) out << "    YYLLOC_DEFAULT(yyloc, (yylsp - yylen), yylen);\n";
         out << "    switch (yyn) {\n";
         emit_cxx_action_switch(out);
         out << "    default: break;\n";
         out << "    }\n";
         out << "    yyssp -= yylen;\n";
         out << "    yyvsp -= yylen;\n";
+        if (L) out << "    yylsp -= yylen;\n";
         out << "    *++yyvsp = yyval;\n";
+        if (L) out << "    *++yylsp = yyloc;\n";
         out << "    {\n";
         out << "        int nt = yyr1[yyn] - YYNTOKENS;\n";
         out << "        int gpos = yypgoto[nt] + *yyssp;\n";
@@ -3267,10 +3353,14 @@ private:
         out << "    }\n";
         out << "    goto yynewstate;\n";
         out << "yyerrlab:\n";
-        out << "    error(\"syntax error\");\n";
+        if (L) out << "    error(yylloc, \"syntax error\");\n";
+        else   out << "    error(\"syntax error\");\n";
         out << "    yyresult = 1;\n";
         out << "yyreturn:\n";
-        out << "    if (yyss != yyssa) { std::free(yyss); std::free(yyvs); }\n";
+        out << "    if (yyss != yyssa) {\n";
+        out << "        std::free(yyss); std::free(yyvs);\n";
+        if (L) out << "        std::free(yyls);\n";
+        out << "    }\n";
         out << "    return yyresult;\n";
         out << "}\n";
         out << "}  // namespace " << g_.api_namespace << "\n";
