@@ -3282,9 +3282,26 @@ private:
         }
     }
 
+    // Header file basename derived from the source-file stem.  Used by
+    // the C++ skeleton to emit `#include "<stem>.tab.hh"` so the .cc
+    // compiles regardless of where the user puts the file.
+    std::string derived_header_basename() {
+        std::string base = g_.source_file;
+        size_t slash = base.find_last_of("/\\");
+        std::string fname = (slash == std::string::npos)
+            ? base : base.substr(slash + 1);
+        size_t dot = fname.find_last_of('.');
+        std::string stem = (dot == std::string::npos)
+            ? fname : fname.substr(0, dot);
+        return stem + ".tab.hh";
+    }
+
     void emit_cxx_main(Buf out, Buf* hdr) {
-        // Header.  When invoked without -d we still emit one, since the
-        // class declaration goes there in C++.
+        // C++ skeleton requires -d to produce a header.  The .cc then
+        // includes "<stem>.tab.hh" via an emitted #include.  Without -d
+        // we still emit the class declaration into the .cc inline, which
+        // makes the file self-contained but means the user can't
+        // forward-declare the parser from a separate compilation unit.
         if (hdr) emit_cxx_header(*hdr);
 
         // Source.
@@ -3294,21 +3311,25 @@ private:
         out << "#include <cstdlib>\n";
         out << "#include <cstring>\n";
         out << "#include <string>\n";
-        // For -d we emit the header above and include it; otherwise emit
-        // the class declaration inline so the .cc compiles standalone.
+        out << "#include <utility>\n";
+        if (g_.api_value_type == "variant") out << "#include <variant>\n";
+
         if (hdr) {
-            // A common convention: header file shares the source's stem.
-            // The user invokes us with `-o foo.tab.cc -d` and ends up with
-            // foo.tab.hh; the default include path is the same directory.
-            // We don't know the exact name here, so re-emit the class decl
-            // inline as a safety net (compiler will still see the header
-            // first if the user includes it).
-            out << "// Inline class declaration fallback:\n";
+            // Bison's lalr1.cc convention: "<stem>.tab.cc" includes
+            // "<stem>.tab.hh" by basename only.  We strip the directory
+            // from the header path so the include works regardless of
+            // where the file is placed.
+            std::string h = opts_.defines_path;  // user override, if any
+            if (h.empty()) h = derived_header_basename();
+            out << "#include \"" << h << "\"\n";
+        } else {
+            // No header: inline the class declaration so the .cc is
+            // self-contained.
+            std::string hbuf;
+            Buf tmp{hbuf};
+            emit_cxx_header(tmp);
+            out << hbuf;
         }
-        std::string hbuf;
-        Buf tmp{hbuf};
-        emit_cxx_header(tmp);
-        out << hbuf;
 
         if (!g_.prologue_requires.empty()) out << g_.prologue_requires << "\n";
         if (!g_.prologue.empty()) {
@@ -3396,10 +3417,39 @@ private:
         out << "yysetstate:\n";
         out << "    *yyssp = (short)yystate;\n";
         out << "    if (yyss + yystacksize - 1 <= yyssp) {\n";
-        if (L) out << "        error(yylloc, \"memory exhausted\");\n";
-        else   out << "        error(\"memory exhausted\");\n";
-        out << "        yyresult = 2;\n";
-        out << "        goto yyreturn;\n";
+        out << "        // Grow the parser stacks: heap-alloc and copy across.\n";
+        out << "        // The first growth comes off the on-stack arrays\n";
+        out << "        // (yyssa/yyvsa[/yylsa]); subsequent growths are\n";
+        out << "        // realloc-style on the heap.  Element constructors\n";
+        out << "        // (variant, std::string members, etc.) are honored:\n";
+        out << "        // we placement-default-construct, then move the live\n";
+        out << "        // prefix across before destroying the old buffer.\n";
+        out << "        long yysize = yyssp - yyss + 1;\n";
+        out << "        if (yystacksize >= YYMAXDEPTH) {\n";
+        if (L) out << "            error(yylloc, \"memory exhausted\");\n";
+        else   out << "            error(\"memory exhausted\");\n";
+        out << "            yyresult = 2; goto yyreturn;\n";
+        out << "        }\n";
+        out << "        long newsize = (long)yystacksize * 2;\n";
+        out << "        if (newsize > YYMAXDEPTH) newsize = YYMAXDEPTH;\n";
+        out << "        short *new_ss = new short[newsize];\n";
+        out << "        semantic_type *new_vs = new semantic_type[newsize];\n";
+        if (L) out << "        location_type *new_ls = new location_type[newsize];\n";
+        out << "        for (long _i = 0; _i < yysize; _i++) {\n";
+        out << "            new_ss[_i] = yyss[_i];\n";
+        out << "            new_vs[_i] = std::move(yyvs[_i]);\n";
+        if (L) out << "            new_ls[_i] = std::move(yyls[_i]);\n";
+        out << "        }\n";
+        out << "        if (yyss != yyssa) {\n";
+        out << "            delete[] yyss; delete[] yyvs;\n";
+        if (L) out << "            delete[] yyls;\n";
+        out << "        }\n";
+        out << "        yyss = new_ss; yyvs = new_vs;\n";
+        if (L) out << "        yyls = new_ls;\n";
+        out << "        yyssp = yyss + yysize - 1;\n";
+        out << "        yyvsp = yyvs + yysize - 1;\n";
+        if (L) out << "        yylsp = yyls + yysize - 1;\n";
+        out << "        yystacksize = (int)newsize;\n";
         out << "    }\n";
         out << "    if (yystate == YYFINAL) { yyresult = 0; goto yyreturn; }\n";
         out << "    yyn = yypact[yystate];\n";
@@ -3473,8 +3523,8 @@ private:
         out << "    yyresult = 1;\n";
         out << "yyreturn:\n";
         out << "    if (yyss != yyssa) {\n";
-        out << "        std::free(yyss); std::free(yyvs);\n";
-        if (L) out << "        std::free(yyls);\n";
+        out << "        delete[] yyss; delete[] yyvs;\n";
+        if (L) out << "        delete[] yyls;\n";
         out << "    }\n";
         out << "    return yyresult;\n";
         out << "}\n";
