@@ -629,8 +629,15 @@ public:
         if (peek_.kind == Tok::EndOfFile) fatal("missing %% before grammar rules");
         advance();
 
-        while (peek_.kind != Tok::EndOfFile && peek_.kind != Tok::DoublePercent)
-            parse_rule();
+        while (peek_.kind != Tok::EndOfFile && peek_.kind != Tok::DoublePercent) {
+            // Bison's own parse-gram.y interleaves %type/%printer/%destructor
+            // declarations with rules.  When we don't see an identifier-colon,
+            // try the declaration parser.
+            if (peek_.kind == Tok::Identifier_Colon)
+                parse_rule();
+            else
+                parse_declaration();
+        }
 
         if (peek_.kind == Tok::DoublePercent)
             g_.epilogue = lex_.take_to_end();
@@ -644,6 +651,29 @@ private:
         if (peek_.kind != t)
             fatalf("expected {} at line {}, got \"{}\"", what, peek_.line, peek_.text.c_str());
         advance();
+    }
+
+    // Bison's parse-gram.y uses _("string") for translatable token aliases.
+    // We treat _("...") as equivalent to a bare "..." in alias positions.
+    bool at_alias_string() const {
+        return at(Tok::StrLit)
+            || (at(Tok::Identifier) && peek_.text == "_");
+    }
+    string consume_alias_string() {
+        if (at(Tok::StrLit)) { string s = peek_.text; advance(); return s; }
+        // _("string")
+        advance();
+        if (!(at(Tok::Punct) && peek_.text == "("))
+            fatalf("expected '(' after '_' alias wrapper at line {}", peek_.line);
+        advance();
+        if (!at(Tok::StrLit))
+            fatalf("expected string literal in _(...) at line {}", peek_.line);
+        string s = peek_.text;
+        advance();
+        if (!(at(Tok::Punct) && peek_.text == ")"))
+            fatalf("expected ')' to close _(...) at line {}", peek_.line);
+        advance();
+        return s;
     }
 
     int sym_of_char(const Token& t) {
@@ -669,6 +699,10 @@ private:
 
     void parse_declaration() {
         const Token t = peek_;
+        // Stray ';' between declarations is allowed (Bison treats it as
+        // an empty declaration -- their parse-gram.y emits "%code requires
+        // {...};" with a trailing semicolon).
+        if (t.kind == Tok::Semi) { advance(); return; }
         switch (t.kind) {
             case Tok::PercentBraces:
                 if (seen_typed_decl_) g_.prologue_late += t.text;
@@ -899,7 +933,18 @@ private:
 
     void parse_code() {
         string qual;
-        if (at(Tok::Identifier)) { qual = peek_.text; advance(); }
+        if (at(Tok::Identifier)) {
+            qual = peek_.text;
+            advance();
+            // Stitch hyphenated qualifiers like "pre-printer" / "post-printer"
+            // (used in Bison's own parse-gram.y).
+            while (at(Tok::Punct) && peek_.text == "-") {
+                qual += "-";
+                advance();
+                if (at(Tok::Identifier)) { qual += peek_.text; advance(); }
+                else break;
+            }
+        }
         if (!at(Tok::BraceBlock)) fatalf("%code: expected {{ at line {}", peek_.line);
         const string& body = peek_.text;
         if (qual.empty()) g_.prologue += body;
@@ -946,7 +991,15 @@ private:
                 advance();
             } else if (at(Tok::CharLit)) {
                 idx = sym_of_char(peek_); advance();
+            } else if (at_alias_string()) {
+                // Bison allows "alias" / _("alias") here to refer to a token
+                // by its alias.  Resolve to the underlying token.
+                idx = sym_of_strlit(consume_alias_string());
             } else break;
+            // Follow alias_of so the type-tag lands on the real token, not
+            // its alias entry.
+            if (idx >= 0 && g_.syms[idx].alias_of >= 0)
+                idx = g_.syms[idx].alias_of;
             if (!tag.empty()) g_.syms[idx].type_tag = tag;
         }
     }
@@ -973,12 +1026,12 @@ private:
                     explicit_code = (int)peek_.ival;
                     advance();
                 }
-                if (at(Tok::StrLit)) { alias_str = peek_.text; advance(); }
+                if (at_alias_string()) alias_str = consume_alias_string();
             } else if (at(Tok::CharLit)) {
                 idx = sym_of_char(peek_); advance();
-                if (at(Tok::StrLit)) advance();
-            } else if (at(Tok::StrLit)) {
-                idx = sym_of_strlit(peek_.text); advance();
+                if (at_alias_string()) consume_alias_string();
+            } else if (at_alias_string()) {
+                idx = sym_of_strlit(consume_alias_string());
             } else break;
             any = true;
             if (!tag.empty()) g_.syms[idx].type_tag = tag;
