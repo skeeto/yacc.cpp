@@ -3537,6 +3537,7 @@ private:
         if (L) out << "    location_type yylloc{};\n";
         out << "    int yychar = -2;\n";
         out << "    int yystate = 0;\n";
+        out << "    int yyerrstatus = 0;\n";
         out << "    int yyn = 0;\n";
         out << "    int yytoken = -2;\n";
         out << "    int yylen = 0;\n";
@@ -3622,6 +3623,7 @@ private:
         out << "        goto yyreduce;\n";
         out << "    }\n";
         out << "    // Shift.\n";
+        out << "    if (yyerrstatus) yyerrstatus--;\n";
         out << "    yystate = yyn;\n";
         out << "    *++yyvsp = std::move(yylval);\n";
         if (L) out << "    *++yylsp = yylloc;\n";
@@ -3661,20 +3663,55 @@ private:
         out << "    }\n";
         out << "    goto yynewstate;\n";
         out << "yyerrlab:\n";
+        out << "    if (!yyerrstatus) {\n";
         if (g_.parse_error_mode == "custom") {
             // User's report_syntax_error owns the diagnostic.  Same
             // contract as bison's lalr1.cc: void return, const method.
-            out << "    {\n";
-            if (L) out << "        context _ctx(symbol_kind_type(yytranslate[yychar]), &yylloc);\n";
-            else   out << "        context _ctx(symbol_kind_type(yytranslate[yychar]));\n";
+            out << "        ";
+            if (L) out << "context _ctx(symbol_kind_type(yytranslate[yychar]), &yylloc);\n";
+            else   out << "context _ctx(symbol_kind_type(yytranslate[yychar]));\n";
             out << "        report_syntax_error(_ctx);\n";
-            out << "    }\n";
         } else if (L) {
-            out << "    error(yylloc, \"syntax error\");\n";
+            out << "        error(yylloc, \"syntax error\");\n";
         } else {
-            out << "    error(\"syntax error\");\n";
+            out << "        error(\"syntax error\");\n";
         }
-        out << "    yyresult = 1;\n";
+        out << "    }\n";
+        // yyerrorlab: re-entry after a YYERROR action (not exposed yet
+        // in the C++ skeleton; kept here so future YYERROR support can
+        // jump straight in).
+        out << "yyerrorlab:\n";
+        out << "    if (yyerrstatus == 3) {\n";
+        out << "        if (yychar <= 0) { yyresult = 1; goto yyreturn; }\n";
+        out << "        yychar = -2;\n";
+        out << "    }\n";
+        // yyerrlab1: pop states until one accepts the `error` token,
+        // then shift error and resume.  Variant slots' destructors run
+        // automatically when the next shift overwrites them or when
+        // the stack array is destroyed at yyreturn.
+        out << "yyerrlab1:\n";
+        out << "    yyerrstatus = 3;\n";
+        out << "    for (;;) {\n";
+        out << "        yyn = yypact[yystate];\n";
+        out << "        if (!yypact_value_is_default(yyn)) {\n";
+        out << "            int err_internal = " << l_.error_internal() << ";\n";
+        out << "            int idx = yyn + err_internal;\n";
+        out << "            if (idx >= 0 && idx < (int)YYTABLE_SIZE &&\n";
+        out << "                yycheck[idx] == err_internal) {\n";
+        out << "                yyn = yytable[idx];\n";
+        out << "                if (yyn > 0) {\n";
+        out << "                    yystate = yyn;\n";
+        out << "                    *++yyvsp = std::move(yylval);\n";
+        if (L) out << "                    *++yylsp = yylloc;\n";
+        out << "                    goto yynewstate;\n";
+        out << "                }\n";
+        out << "            }\n";
+        out << "        }\n";
+        out << "        if (yyssp == yyss) { yyresult = 1; goto yyreturn; }\n";
+        out << "        yyvsp--;\n";
+        if (L) out << "        yylsp--;\n";
+        out << "        yystate = *--yyssp;\n";
+        out << "    }\n";
         out << "yyreturn:\n";
         out << "    if (yyss != yyssa) {\n";
         out << "        delete[] yyss; delete[] yyvs;\n";
