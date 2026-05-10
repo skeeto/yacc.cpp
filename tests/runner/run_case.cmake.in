@@ -15,6 +15,13 @@ if(EXISTS ${CASE_DIR}/driver.cc)
     set(IS_CXX 1)
 endif()
 
+# Test cases may be tagged as yacc-only (where bison rejects the input,
+# e.g. yacc.cpp extensions like C++ push parser).  Skip silently when
+# running the bison side -- the yacc side still runs.
+if(GEN STREQUAL "bison" AND EXISTS ${CASE_DIR}/skip_bison)
+    return()
+endif()
+
 # Read optional options.txt
 set(EXTRA_OPTS "")
 if(EXISTS ${CASE_DIR}/options.txt)

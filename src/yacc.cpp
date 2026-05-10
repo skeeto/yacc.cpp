@@ -3299,7 +3299,19 @@ private:
         }
         hdr << ");\n";
         hdr << "        virtual ~" << g_.api_parser_class << "();\n";
-        hdr << "        virtual int parse();\n";
+        const bool push_only = (g_.api_push_pull == "push");
+        const bool push_both = (g_.api_push_pull == "both");
+        if (!push_only) hdr << "        virtual int parse();\n";
+        if (push_only || push_both) {
+            hdr << "        // Push-parse API.  YYPUSH_MORE = the parser is\n";
+            hdr << "        // ready for another token; any other return\n";
+            hdr << "        // value (0 = accept, non-zero = error) means the\n";
+            hdr << "        // parse is done.\n";
+            hdr << "        static const int YYPUSH_MORE = 4;\n";
+            hdr << "        int push_parse(int kind, semantic_type val";
+            if (g_.want_locations) hdr << ", location_type loc";
+            hdr << ");\n";
+        }
         if (g_.want_locations) {
             hdr << "        virtual void error(const location_type& loc, "
                    "const std::string& msg);\n";
@@ -3338,6 +3350,23 @@ private:
         if (!g_.parse_params.empty()) {
             hdr << "    private:\n";
             for (auto& p : g_.parse_params) hdr << "        " << p << ";\n";
+            hdr << "    public:\n";
+        }
+        // Push-parse state: lives on the parser instance so push_parse
+        // can return between calls and resume.  Only emitted when push
+        // mode is requested.
+        if (push_only || push_both) {
+            hdr << "    private:\n";
+            hdr << "        bool yynew_ = true;\n";
+            hdr << "        int yystate_ = 0;\n";
+            hdr << "        int yyerrstatus_ = 0;\n";
+            hdr << "        int yystacksize_ = 0;\n";
+            hdr << "        short* yyss_ = nullptr;\n";
+            hdr << "        semantic_type* yyvs_ = nullptr;\n";
+            if (g_.want_locations) hdr << "        location_type* yyls_ = nullptr;\n";
+            hdr << "        short* yyssp_ = nullptr;\n";
+            hdr << "        semantic_type* yyvsp_ = nullptr;\n";
+            if (g_.want_locations) hdr << "        location_type* yylsp_ = nullptr;\n";
             hdr << "    public:\n";
         }
         hdr << "    };\n";
@@ -3385,6 +3414,139 @@ private:
                 out << "      { " << translate_action(p) << " }\n";
             out << "      break;\n";
         }
+    }
+
+    // Push-parse implementation: drives the same shift-reduce loop as
+    // parse(), but the state lives on the parser instance (yystate_,
+    // yyss_, ...) so each call can return YYPUSH_MORE at the read-token
+    // point and resume on the next call.  The user feeds tokens via
+    // push_parse(kind, val[, loc]); the parser drives forward until it
+    // either accepts, errors, or needs another token.
+    void emit_cxx_push_body(Buf out, bool L) {
+        out << "int " << g_.api_parser_class
+            << "::push_parse(int yychar, semantic_type yylval";
+        if (L) out << ", location_type yylloc";
+        out << ") {\n";
+        // Declare the per-call locals that don't survive across calls.
+        out << "    int yyn = 0;\n";
+        out << "    int yytoken = -2;\n";
+        out << "    int yylen = 0;\n";
+        out << "    semantic_type yyval{};\n";
+        if (L) out << "    location_type yyloc{};\n";
+        // First call: initialize the on-instance stacks.  Subsequent
+        // calls jump past this block.
+        out << "    if (yynew_) {\n";
+        out << "        yynew_ = false;\n";
+        out << "        yystacksize_ = YYINITDEPTH;\n";
+        out << "        yyss_ = new short[yystacksize_];\n";
+        out << "        yyvs_ = new semantic_type[yystacksize_];\n";
+        if (L) out << "        yyls_ = new location_type[yystacksize_];\n";
+        out << "        yyssp_ = yyss_;\n";
+        out << "        yyvsp_ = yyvs_;\n";
+        if (L) out << "        yylsp_ = yyls_;\n";
+        out << "        *yyssp_ = 0;\n";
+        out << "    }\n";
+        // Stash the just-pushed token into local yychar / yylval / yylloc
+        // and goto yybackup (skipping yysetstate).
+        out << "    goto yyhave_token;\n";
+        out << "yynewstate:\n";
+        out << "    yyssp_++;\n";
+        out << "yysetstate:\n";
+        out << "    *yyssp_ = (short)yystate_;\n";
+        out << "    if (yyss_ + yystacksize_ - 1 <= yyssp_) {\n";
+        out << "        long yysize = yyssp_ - yyss_ + 1;\n";
+        out << "        if (yystacksize_ >= YYMAXDEPTH) {\n";
+        if (L) out << "            error(yylloc, \"memory exhausted\");\n";
+        else   out << "            error(\"memory exhausted\");\n";
+        out << "            return 2;\n";
+        out << "        }\n";
+        out << "        long newsize = (long)yystacksize_ * 2;\n";
+        out << "        if (newsize > YYMAXDEPTH) newsize = YYMAXDEPTH;\n";
+        out << "        short* new_ss = new short[newsize];\n";
+        out << "        semantic_type* new_vs = new semantic_type[newsize];\n";
+        if (L) out << "        location_type* new_ls = new location_type[newsize];\n";
+        out << "        for (long _i = 0; _i < yysize; _i++) {\n";
+        out << "            new_ss[_i] = yyss_[_i];\n";
+        out << "            new_vs[_i] = std::move(yyvs_[_i]);\n";
+        if (L) out << "            new_ls[_i] = std::move(yyls_[_i]);\n";
+        out << "        }\n";
+        out << "        delete[] yyss_; delete[] yyvs_;\n";
+        if (L) out << "        delete[] yyls_;\n";
+        out << "        yyss_ = new_ss; yyvs_ = new_vs;\n";
+        if (L) out << "        yyls_ = new_ls;\n";
+        out << "        yyssp_ = yyss_ + yysize - 1;\n";
+        out << "        yyvsp_ = yyvs_ + yysize - 1;\n";
+        if (L) out << "        yylsp_ = yyls_ + yysize - 1;\n";
+        out << "        yystacksize_ = (int)newsize;\n";
+        out << "    }\n";
+        out << "    if (yystate_ == YYFINAL) return 0;\n";
+        out << "    yyn = yypact[yystate_];\n";
+        out << "    if (yypact_value_is_default(yyn)) goto yydefault;\n";
+        // The pause point: if we don't have a token already, ask for one.
+        out << "    return YYPUSH_MORE;\n";
+        out << "yyhave_token:\n";
+        out << "    yyn = yypact[yystate_];\n";
+        out << "    if (yypact_value_is_default(yyn)) goto yydefault;\n";
+        out << "    if (yychar <= 0) { yychar = 0; yytoken = 0; }\n";
+        out << "    else yytoken = YYTRANSLATE(yychar);\n";
+        out << "    yyn += yytoken;\n";
+        out << "    if (yyn < 0 || yyn >= (int)YYTABLE_SIZE || yycheck[yyn] != yytoken)\n";
+        out << "        goto yydefault;\n";
+        out << "    yyn = yytable[yyn];\n";
+        out << "    if (yyn <= 0) {\n";
+        out << "        if (yytable_value_is_error(yyn)) goto yyerrlab;\n";
+        out << "        if (yyn == 0) return 0;\n";
+        out << "        yyn = -yyn;\n";
+        out << "        goto yyreduce;\n";
+        out << "    }\n";
+        out << "    if (yyerrstatus_) yyerrstatus_--;\n";
+        out << "    yystate_ = yyn;\n";
+        out << "    *++yyvsp_ = std::move(yylval);\n";
+        if (L) out << "    *++yylsp_ = yylloc;\n";
+        out << "    goto yynewstate;\n";
+        out << "yydefault:\n";
+        out << "    yyn = yydefact[yystate_];\n";
+        out << "    if (yyn == 0) goto yyerrlab;\n";
+        out << "    goto yyreduce;\n";
+        out << "yyreduce:\n";
+        out << "    yylen = yyr2[yyn];\n";
+        if (g_.api_value_type == "variant") {
+            out << "    yyval = semantic_type{};\n";
+        } else {
+            out << "    if (yylen) yyval = std::move(yyvsp_[1 - yylen]);\n";
+            out << "    else yyval = semantic_type{};\n";
+        }
+        if (L) out << "    YYLLOC_DEFAULT(yyloc, (yylsp_ - yylen), yylen);\n";
+        // Action switch: rebind yyvsp/yylsp to push-state pointers via
+        // local references so the existing translate_action output still
+        // compiles.
+        out << "    {\n";
+        out << "        semantic_type* yyvsp = yyvsp_;\n";
+        if (L) out << "        location_type* yylsp = yylsp_;\n";
+        out << "        switch (yyn) {\n";
+        emit_cxx_action_switch(out);
+        out << "        default: break;\n";
+        out << "        }\n";
+        out << "    }\n";
+        out << "    yyssp_ -= yylen;\n";
+        out << "    yyvsp_ -= yylen;\n";
+        if (L) out << "    yylsp_ -= yylen;\n";
+        out << "    *++yyvsp_ = std::move(yyval);\n";
+        if (L) out << "    *++yylsp_ = yyloc;\n";
+        out << "    {\n";
+        out << "        int nt = yyr1[yyn] - YYNTOKENS;\n";
+        out << "        int gpos = yypgoto[nt] + *yyssp_;\n";
+        out << "        if (gpos >= 0 && gpos < (int)YYTABLE_SIZE && yycheck[gpos] == *yyssp_)\n";
+        out << "            yystate_ = yytable[gpos];\n";
+        out << "        else\n";
+        out << "            yystate_ = yydefgoto[nt];\n";
+        out << "    }\n";
+        out << "    goto yynewstate;\n";
+        out << "yyerrlab:\n";
+        if (L) out << "    error(yylloc, \"syntax error\");\n";
+        else   out << "    error(\"syntax error\");\n";
+        out << "    return 1;\n";
+        out << "}\n";
     }
 
     // Header file basename derived from the source-file stem.  Used by
@@ -3530,8 +3692,10 @@ private:
         }
 
         // The state machine.  Same shift-reduce logic as the C driver, but
-        // class-scoped: yyerror -> error(), no parse-param plumbing yet,
-        // no error recovery beyond a single error report and abort.
+        // class-scoped: yyerror -> error(), error recovery via yyerrlab1.
+        // Emitted only when the pull API is requested (default or "both").
+        const bool emit_pull = (g_.api_push_pull != "push");
+        if (!emit_pull) goto skip_pull;
         out << "int " << g_.api_parser_class << "::parse() {\n";
         out << "    semantic_type yylval{};\n";
         if (L) out << "    location_type yylloc{};\n";
@@ -3719,6 +3883,13 @@ private:
         out << "    }\n";
         out << "    return yyresult;\n";
         out << "}\n";
+
+    skip_pull:
+        // Push-parse implementation when api.push-pull == push|both.
+        if (g_.api_push_pull == "push" || g_.api_push_pull == "both") {
+            emit_cxx_push_body(out, L);
+        }
+
         out << "}  // namespace " << g_.api_namespace << "\n";
 
         if (!g_.epilogue.empty()) {
