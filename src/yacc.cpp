@@ -299,7 +299,7 @@ enum class Tok : uint16_t {
     PercentDefines, PercentHeader,
     PercentParseParam, PercentLexParam,
     PercentRequire, PercentVerbose, PercentYacc,
-    PercentPureParser, PercentGlrParser,
+    PercentPureParser, PercentGlrParser, PercentErrorVerbose,
     PercentToken_Table, PercentNoLines, PercentOutput, PercentFilePrefix,
     PercentParam,
     PercentBraces,
@@ -551,6 +551,7 @@ private:
             {"pure-parser", Tok::PercentPureParser},
             {"pure_parser", Tok::PercentPureParser},  /* old underscore variant */
             {"glr-parser", Tok::PercentGlrParser},
+            {"error-verbose", Tok::PercentErrorVerbose},
             {"token-table", Tok::PercentToken_Table},
             {"no-lines", Tok::PercentNoLines},
             {"output", Tok::PercentOutput},
@@ -825,6 +826,13 @@ private:
             case Tok::PercentGlrParser:
                 advance();
                 g_.is_glr = true;
+                return;
+            case Tok::PercentErrorVerbose:
+                // Deprecated form of `%define parse.error verbose`.  Bison
+                // and yacc.cpp both still accept it (binutils' yyscript.y
+                // and other long-lived grammars use it).
+                advance();
+                g_.parse_error_mode = "verbose";
                 return;
             case Tok::PercentToken_Table: advance(); opts_.token_table = true; return;
             case Tok::PercentNoLines: advance(); opts_.no_lines = true; return;
@@ -1129,8 +1137,26 @@ private:
         if (g_.start_sym < 0) g_.start_sym = lhs_idx;
 
         parse_alternative(lhs_idx, lhs_name);
-        while (at(Tok::Or)) { advance(); parse_alternative(lhs_idx, lhs_name); }
-        if (at(Tok::Semi)) advance();
+        // Bison allows `;` between alternative groups -- a rule may be:
+        //   foo: A | B
+        //   ;
+        //      | C
+        //   ;
+        // and ld/rl78-parse.y / similar use this to break up long
+        // instruction-encoding rules.  So we loop alternating between
+        // `|` (next alt) and `;` (soft separator); only stop on a
+        // hard boundary (next rule LHS, declaration, %%).
+        while (true) {
+            if (at(Tok::Or)) {
+                advance();
+                parse_alternative(lhs_idx, lhs_name);
+            } else if (at(Tok::Semi)) {
+                advance();
+                if (!at(Tok::Or)) break;  // semi only -- rule done
+            } else {
+                break;
+            }
+        }
     }
 
     void parse_alternative(int lhs_idx, const string& lhs_name) {
