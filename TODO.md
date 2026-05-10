@@ -7,29 +7,31 @@ implemented at all. Roughly grouped by effort.
 
 ### C++ skeleton remaining items
 
-The basic `%language "c++"` / `%skeleton "lalr1.cc"` path is in place,
-producing a `namespace yy { class parser { ... }; }` with `parse()`,
-virtual `error()`, token-kind enum, and `semantic_type` typedef.
-`%locations` plumbs `position`/`location` classes; `%define
-api.value.type variant` builds on `std::variant` with per-rule
-emplace; `%define api.value.automove` wraps `$N` in `std::move`;
-`%define api.token.constructor` adds `make_NAME` factories and a
-`symbol_type` returned by `yylex`.  `%define api.namespace` and
-`%define api.parser.class` configure the names.
+The `%language "c++"` / `%skeleton "lalr1.cc"` path emits a working
+`namespace yy { class parser { ... }; }` with everything most grammars
+need: `parse()`, virtual `error()`, token-kind enum,
+`symbol_kind`/`symbol_kind_type`, static `symbol_name()`,
+`semantic_type` typedef, growable heap stacks, `%locations` →
+`position`/`location` classes (with `<<` ostream operators and
+`position::filename`), `%define api.value.type variant` on
+`std::variant`, `%define api.value.automove`, `%define
+api.token.constructor` (`symbol_type` + `make_NAME` factories),
+`%parse-param`, `%define parse.error custom` (`report_syntax_error`
+hook with a `context` class), and `%define api.namespace` /
+`api.parser.class` for the names.
 
-Still missing for full Bison-compat:
+Still missing:
 
-- `enum class symbol_kind` with member-function token-name lookup
-  (currently we expose `token::yytokentype` only).
-- `report_syntax_error` virtual hook (`%define parse.error custom`
-  for the C++ path).
-- C++ push parser support (`%define api.push-pull push|both`).
-- C++ GLR (`%glr-parser` interaction with `%language "c++"`).
-- Stack growth + destructors in the C++ state machine (currently a
-  fixed YYINITDEPTH stack with `error("memory exhausted")` on
-  overflow).
-- More elaborate `position`/`location` API (stream operators,
-  `position::filename`, line-number arithmetic).
+- C++ push parser (`%define api.push-pull push|both`) -- the C path
+  has it; the C++ class needs equivalent stepping API.
+- C++ GLR (`%glr-parser` × `%language "c++"`) -- C path has the
+  tree-of-stacks runtime; mirroring it in a class is non-trivial.
+- Error recovery (the C path's `yyerrlab1` / error-token-shift
+  mechanism).  Without it, the C++ parser aborts on first error
+  rather than recovering.
+- `%destructor` directive in the C++ path -- only fires during error
+  recovery / GLR pruning, both of which the C++ path doesn't yet do.
+- Free-function `%lex-param` plumbing for C++.
 
 ### GLR: full Tomita GSS
 
@@ -70,26 +72,11 @@ left.
 
 ## Small items
 
-### `%define api.value.automove` (C++ only)
-
-Wrap each `$N` in actions with `std::move(...)`. Depends on the C++ skeleton.
-Touches `translate_action`.
-
-### `%define api.value.type variant` (C++ only)
-
-Emit a tagged-union value type with proper constructors / destructors. Depends
-on the C++ skeleton + the destructor infrastructure already in place.
-
-### `%define api.token.constructor` (C++ only)
-
-Tokens become typed values constructed through `make_NAME(value)` factory
-functions. Pairs with `api.value.type variant`. C++ only.
-
 ### Other output languages (D, Java)
 
 Bison can produce D and Java parsers via the `lalr1.d` and `lalr1.java`
-skeletons. Only meaningful after the C++ skeleton lands and the skeleton
-interface is properly factored.
+skeletons. Only meaningful after the C++ skeleton interface is
+properly factored (currently emit_cxx_main is monolithic).
 
 ## Robustness
 
